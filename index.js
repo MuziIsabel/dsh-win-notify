@@ -1,0 +1,332 @@
+// dsh-win-notify — Windows 任务完成提醒插件
+//
+// 任务回合结束（agent/status: running → idle）时弹出 Windows Toast 通知并播放提示音。
+//
+// 关键实现点：
+//  - Windows 只展示「已注册身份」的 toast：插件激活时自动注册桌面应用身份 ——
+//    编译一个 DeepSeek.exe 占位程序 + 开始菜单 DeepSeek.lnk 快捷方式
+//    （图标用官方 favicon 生成的多尺寸 DeepSeek.ico），
+//    AppUserModelID = DSH.WinNotify，通知显示名与图标即 DeepSeek；
+//  - 注册失败或 powershell.exe 缺失时回退到 NotifyIcon 气泡（无需注册也能显示）；
+//  - 中文通过 -EncodedCommand（UTF-16LE base64）传递，不会乱码；
+//  - 用户手动停止（turn/end reason: aborted）不算完成，不弹通知。
+//  - 运行日志写到 $DSH_HOME/dsh-win-notify.log。
+
+import { spawn } from "node:child_process";
+import { existsSync, appendFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import z from "@deepseek-ai/schemastery";
+
+export const name = "dsh-win-notify";
+
+export const Config = z.object({
+  enabled: z.boolean().default(true),
+  // default | reminder | sms | alarm | silent
+  sound: z.string().default("default"),
+  onError: z.boolean().default(true),
+  title: z.string().default("DeepSeek Harness"),
+  body: z.string().default("任务已完成"),
+  bodyError: z.string().default("任务出错"),
+  maxPromptChars: z.number().default(64),
+});
+
+const DEFAULTS = {
+  enabled: true,
+  sound: "default",
+  onError: true,
+  title: "DeepSeek Harness",
+  body: "任务已完成",
+  bodyError: "任务出错",
+  maxPromptChars: 64,
+};
+
+/** 注册过的 toast 身份（必须与开始菜单快捷方式的 AppUserModelID 一致）。 */
+const APP_ID = "DSH.WinNotify";
+const SHORTCUT_NAME = "DeepSeek.lnk";
+const OLD_SHORTCUT_NAME = "dsh-win-notify.lnk";
+const APP_DIR_NAME = "DeepSeek"; // %LOCALAPPDATA%\DeepSeek
+const STUB_EXE = "DeepSeek.exe";
+const ICON_FILE = "DeepSeek.ico";
+const PLUGIN_DIR = fileURLToPath(new URL(".", import.meta.url));
+const ICON_SOURCE = join(PLUGIN_DIR, "assets", ICON_FILE);
+const LOG_FILE = join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "dsh-win-notify.log");
+function log(msg) {
+  try { appendFileSync(LOG_FILE, `[${new Date().toISOString()}] pid=${process.pid} ${msg}\n`); } catch { /* 忽略日志错误 */ }
+}
+log("module loaded"); // 模块被 import 时立即记录
+
+/** ms-winsoundevent 声音映射；null 表示静音。 */
+const SOUNDS = {
+  default: "ms-winsoundevent:Notification.Default",
+  reminder: "ms-winsoundevent:Notification.Reminder",
+  sms: "ms-winsoundevent:Notification.SMS",
+  alarm: "ms-winsoundevent:Notification.Looping.Alarm",
+  silent: null,
+};
+
+/** Windows PowerShell 5.1（带 WinRT 投影，能弹 Toast）。 */
+const PS5 = join(
+  process.env.SystemRoot ?? "C:\\Windows",
+  "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+);
+
+/** C# 帮助类：给 .lnk 快捷方式写 AppUserModelID（IPropertyStore P/Invoke）。 */
+const PROPSTORE_CS = "using System;\nusing System.Runtime.InteropServices;\n\npublic static class PropStore\n{\n    private static readonly Guid IID_IPropertyStore = new Guid(\"886d8eeb-8cf2-4446-8d02-cdba1dbdcf99\");\n    private static readonly Guid PKEY_AppUserModel_ID = new Guid(\"9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3\");\n\n    [StructLayout(LayoutKind.Sequential)]\n    private struct PropertyKey { public Guid fmtid; public uint pid; }\n\n    [ComImport, Guid(\"886d8eeb-8cf2-4446-8d02-cdba1dbdcf99\"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]\n    private interface IPropertyStore\n    {\n        int GetCount(out uint cProps);\n        int GetAt(uint iProp, out PropertyKey pkey);\n        int GetValue(ref PropertyKey key, out IntPtr pv);\n        int SetValue(ref PropertyKey key, ref PropVariant pv);\n        int Commit();\n    }\n\n    [StructLayout(LayoutKind.Explicit)]\n    private struct PropVariant\n    {\n        [FieldOffset(0)] public ushort vt;\n        [FieldOffset(8)] public IntPtr ptr;\n    }\n\n    [DllImport(\"shell32.dll\", CharSet = CharSet.Unicode)]\n    private static extern int SHGetPropertyStoreFromParsingName(string pszPath, IntPtr pbc, uint flags, ref Guid riid, out IntPtr ppv);\n\n    [DllImport(\"ole32.dll\")]\n    private static extern int PropVariantClear(ref IntPtr pvar);\n\n    /// <summary>Write appId onto the shortcut's AppUserModelID property (idempotent).</summary>\n    public static void SetAppUserModelId(string lnkPath, string appId)\n    {\n        Guid iid = IID_IPropertyStore;\n        IntPtr storePtr;\n        int hr = SHGetPropertyStoreFromParsingName(lnkPath, IntPtr.Zero, 2 /*GPS_READWRITE*/, ref iid, out storePtr);\n        if (hr != 0) throw new COMException(\"open: 0x\" + hr.ToString(\"X8\"));\n        object obj = Marshal.GetObjectForIUnknown(storePtr);\n        try\n        {\n            IPropertyStore store = (IPropertyStore)obj;\n            PropertyKey key = new PropertyKey { fmtid = PKEY_AppUserModel_ID, pid = 5 };\n            PropVariant write = new PropVariant { vt = 31, ptr = Marshal.StringToCoTaskMemUni(appId) };\n            try\n            {\n                hr = store.SetValue(ref key, ref write);\n                if (hr != 0) throw new COMException(\"SetValue: 0x\" + hr.ToString(\"X8\"));\n                hr = store.Commit();\n                if (hr != 0) throw new COMException(\"Commit: 0x\" + hr.ToString(\"X8\"));\n            }\n            finally { PropVariantClear(ref write.ptr); }\n        }\n        finally { Marshal.FinalReleaseComObject(obj); }\n    }\n}\n";
+
+/** 身份注册脚本（幂等）：占位程序 + 图标 + 快捷方式 + AUMID，并迁移旧快捷方式。 */
+function registrationScript() {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "$appDir = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) '" + APP_DIR_NAME + "'",
+    "New-Item -ItemType Directory -Force -Path $appDir | Out-Null",
+    "$exe = Join-Path $appDir '" + STUB_EXE + "'",
+    "if (-not (Test-Path $exe)) {",
+    "  Add-Type -TypeDefinition @'",
+    "using System;",
+    "class Program { static void Main() { } }",
+    "'@ -OutputAssembly $exe -OutputType ConsoleApplication",
+    "}",
+    "Copy-Item '" + ICON_SOURCE + "' (Join-Path $appDir '" + ICON_FILE + "') -Force",
+    "$startMenu = [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)",
+    "$lnkPath = Join-Path $startMenu '" + SHORTCUT_NAME + "'",
+    "$shell = New-Object -ComObject WScript.Shell",
+    "$lnk = $shell.CreateShortcut($lnkPath)",
+    "$lnk.TargetPath = $exe",
+    "$lnk.IconLocation = (Join-Path $appDir '" + ICON_FILE + "')",
+    "$lnk.Description = 'DeepSeek Harness notifications'",
+    "$lnk.Save()",
+    "[System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($lnk) | Out-Null",
+    "Add-Type -TypeDefinition @'",
+    PROPSTORE_CS,
+    "'@",
+    "$done = $false",
+    "$attempts = 0",
+    "do {",
+    "  try {",
+    "    [PropStore]::SetAppUserModelId($lnkPath, '" + APP_ID + "')",
+    "    $done = $true",
+    "  } catch {",
+    "    $attempts++",
+    "    if ($attempts -ge 5) { throw }",
+    "    Start-Sleep -Milliseconds 600",
+    "  }",
+    "} while (-not $done)",
+    "$old = Join-Path $startMenu '" + OLD_SHORTCUT_NAME + "'",
+    "if (Test-Path $old) { Remove-Item $old -Force }",
+    "Write-Output 'registered'",
+  ].join("\n");
+}
+
+/** 启动一个独立的 PowerShell 进程执行脚本（fire-and-forget）。 */
+function runPowerShell(ctx, executable, script, onDone, label) {
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  let child;
+  try {
+    child = spawn(executable, ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+      stdio: ["ignore", "ignore", "pipe"],
+      windowsHide: true,
+    });
+  } catch (error) {
+    log(`spawn fail ${label}: ${error.message}`);
+    ctx.logger.warn(`dsh-win-notify: 无法启动通知进程 ${executable}: ${error.message}`);
+    onDone?.(false, "");
+    return;
+  }
+  let stderr = "";
+  child.stderr.on("data", (d) => { stderr += d.toString("utf8"); });
+  let failed = false;
+  child.on("error", (error) => {
+    failed = true;
+    log(`process error ${label}: ${error.message}`);
+    ctx.logger.warn(`dsh-win-notify: 通知进程错误: ${error.message}`);
+    onDone?.(false, stderr);
+  });
+  child.on("exit", (code) => {
+    log(`exit ${label}: code=${code} stderr=${stderr.slice(0, 600).replace(/\\s+/g, " ")}`);
+    if (code !== 0 && !failed) {
+      ctx.logger.warn(`dsh-win-notify: 通知进程退出码 ${code}`);
+      onDone?.(false, stderr);
+      return;
+    }
+    onDone?.(code === 0, stderr);
+  });
+}
+
+function escapeXml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function truncate(text, max) {
+  const t = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (t.length <= max) return t;
+  return t.slice(0, max) + "…";
+}
+
+/** 该会话最近一次 turn/end 的 reason（undefined = 找不到）。 */
+function lastTurnEndReason(agent) {
+  try {
+    const events = agent?.session?.events ?? [];
+    for (let i = events.length - 1; i >= 0; i--) {
+      const event = events[i];
+      if (event?.type !== "turn/end") continue;
+      return event.data?.reason;
+    }
+  } catch { /* 投影失败按完成处理 */ }
+  return undefined;
+}
+
+/** 该会话最近一条「用户本人」消息的文本（跳过系统注入的 runtime context / system-reminder）。 */
+function lastUserPrompt(agent) {
+  try {
+    const events = agent?.session?.events ?? [];
+    for (let i = events.length - 1; i >= 0; i--) {
+      const event = events[i];
+      if (event?.type !== "user/message") continue;
+      const data = event.data;
+      const sourceKind = data?.source?.kind;
+      if (sourceKind !== undefined && sourceKind !== "user") continue; // 系统注入（plugin/skill-catalog 等），跳过
+      const block = Array.isArray(data?.content) ? data.content[0] : null;
+      if (block?.type === "text" && typeof block.text === "string") {
+        const text = block.text.trim();
+        if (text !== "") return text;
+      }
+    }
+  } catch { /* 忽略 */ }
+  return "";
+}
+
+/** 生成弹 Toast 的 PowerShell 脚本（WinRT ToastNotification，注册身份）。 */
+function toastScript(title, body, sound) {
+  const src = Object.hasOwn(SOUNDS, sound) ? SOUNDS[sound] : SOUNDS.default;
+  const audio = src === null
+    ? '<audio silent="true" />'
+    : `<audio src="${escapeXml(src)}" />`;
+  const textTitle = escapeXml(title);
+  const textBody = escapeXml(body);
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null",
+    "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null",
+    `$xmlText = '<toast duration="long"><visual><binding template="ToastGeneric"><text>${textTitle}</text><text>${textBody}</text></binding></visual>${audio}</toast>'`,
+    "$doc = New-Object Windows.Data.Xml.Dom.XmlDocument",
+    "$doc.LoadXml($xmlText)",
+    "$toast = New-Object Windows.UI.Notifications.ToastNotification $doc",
+    `$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('${APP_ID}')`,
+    "$notifier.Show($toast)",
+  ].join("\n");
+}
+
+/** 回退方案：pwsh + NotifyIcon 气泡（带系统提示音）。 */
+function balloonScript(title, body) {
+  const textTitle = escapeXml(title);
+  const textBody = escapeXml(body);
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "$icon = [System.Drawing.SystemIcons]::Information",
+    "$n = New-Object System.Windows.Forms.NotifyIcon",
+    "$n.Icon = $icon",
+    `$n.BalloonTipTitle = '${textTitle}'`,
+    `$n.BalloonTipText = '${textBody}'`,
+    "$n.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info",
+    "$n.Visible = $true",
+    "$n.ShowBalloonTip(8000)",
+    "Start-Sleep -Milliseconds 8500",
+    "$n.Dispose()",
+  ].join("\n");
+}
+
+/** 模块级缓存：本进程内注册成功则不再重复；失败则允许稍后重试。 */
+let registrationReady = null;
+let lastAttemptAt = 0;
+const REGISTER_RETRY_MIN_MS = 10000;
+
+function ensureRegistered(ctx) {
+  if (registrationReady !== null) return registrationReady;
+  if (!existsSync(PS5)) {
+    registrationReady = Promise.resolve(false);
+    return registrationReady;
+  }
+  // 上次失败后 10 秒内不重试，避免反复 spawn
+  if (Date.now() - lastAttemptAt < REGISTER_RETRY_MIN_MS) return Promise.resolve(false);
+  lastAttemptAt = Date.now();
+  log("registration attempt start");
+  registrationReady = new Promise((resolve) => {
+    runPowerShell(ctx, PS5, registrationScript(), (ok, stderr) => {
+      log(`registration attempt done: ok=${ok}`);
+      if (ok) {
+        ctx.logger.info(`dsh-win-notify: 通知身份 ${APP_ID} 已注册（${SHORTCUT_NAME}）`);
+      } else {
+        ctx.logger.warn("dsh-win-notify: 通知身份注册失败，将回退到气泡通知，稍后会重试");
+        registrationReady = null; // 下次调用重试
+      }
+      resolve(ok);
+    }, "register");
+  });
+  return registrationReady;
+}
+
+function showToast(ctx, cfg, title, body) {
+  if (!existsSync(PS5)) {
+    ctx.logger.warn("dsh-win-notify: 找不到 powershell.exe，无法发送系统通知");
+    return;
+  }
+  const useToast = (registered) => {
+    if (registered) {
+      log(`toast shown via registered identity: ${title} | ${body}`);
+      runPowerShell(ctx, PS5, toastScript(title, body, cfg.sound), undefined, "toast");
+    } else if (process.platform === "win32") {
+      log(`toast shown via balloon fallback: ${title} | ${body}`);
+      runPowerShell(ctx, "pwsh", balloonScript(title, body), undefined, "balloon");
+    }
+  };
+  // 注册通常 ~2 秒完成；超时则直接走气泡回退，避免阻塞任务完成通知。
+  const timeout = new Promise((resolve) => setTimeout(() => resolve(false), 15000));
+  Promise.race([ensureRegistered(ctx), timeout]).then(useToast, () => useToast(false));
+}
+
+export function apply(ctx, config = {}) {
+  const cfg = { ...DEFAULTS, ...config };
+  if (!cfg.enabled) return;
+
+  /** agent -> 开始运行的时间戳；仅在 running→idle 且确实运行过时通知。 */
+  const runningSince = new Map();
+
+  const notify = (agent, body) => {
+    const prompt = truncate(lastUserPrompt(agent), cfg.maxPromptChars);
+    const text = prompt ? `${body}：${prompt}` : body;
+    showToast(ctx, cfg, cfg.title, text);
+  };
+
+  ctx.on("agent/status", ({ status, agent }) => {
+    if (status === "running") {
+      runningSince.set(agent, Date.now());
+      return;
+    }
+    if (status !== "idle") return;
+    const started = runningSince.get(agent);
+    runningSince.delete(agent);
+    if (started === undefined) return; // 本来就是 idle，无任务完成
+
+    const reason = lastTurnEndReason(agent);
+    if (reason?.kind === "aborted") return; // 用户手动停止，不算完成
+    if (reason?.kind === "error") {
+      if (!cfg.onError) return;
+      const message = truncate(reason.error?.message ?? "未知错误", 120);
+      notify(agent, `${cfg.bodyError}：${message}`);
+      return;
+    }
+    notify(agent, cfg.body);
+  });
+
+  log(`apply: enabled, sound=${cfg.sound}`);
+  void ensureRegistered(ctx); // 激活即注册，不阻塞
+  ctx.logger.info(`dsh-win-notify: 已启用（sound=${cfg.sound}, onError=${cfg.onError}）`);
+}

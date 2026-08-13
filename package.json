@@ -1,0 +1,38 @@
+{
+  "name": "dsh-win-notify",
+  "version": "1.0.0",
+  "description": "DSH plugin: Windows toast notification with sound when an agent task completes.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "assets",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "notification",
+    "windows",
+    "toast"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MuziIsabel/dsh-win-notify.git"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  }
+}
