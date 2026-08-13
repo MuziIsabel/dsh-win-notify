@@ -1,7 +1,7 @@
 {
   "name": "dsh-win-notify",
-  "version": "1.0.0",
-  "description": "DSH plugin: Windows toast notification with sound when an agent task completes.",
+  "version": "1.1.0",
+  "description": "DSH plugin: Windows toast notification with sound when an agent task completes or is waiting for user approval.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -21,7 +21,8 @@
     "plugin",
     "notification",
     "windows",
-    "toast"
+    "toast",
+    "approval"
   ],
   "repository": {
     "type": "git",
@@ -34,5 +35,8 @@
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "scripts": {
+    "test": "node --experimental-test-module-mocks --test \"test/*.test.mjs\""
   }
 }

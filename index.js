@@ -9,7 +9,8 @@
 //    AppUserModelID = DSH.WinNotify，通知显示名与图标即 DeepSeek；
 //  - 注册失败或 powershell.exe 缺失时回退到 NotifyIcon 气泡（无需注册也能显示）；
 //  - 中文通过 -EncodedCommand（UTF-16LE base64）传递，不会乱码；
-//  - 用户手动停止（turn/end reason: aborted）不算完成，不弹通知。
+//  - 用户手动停止（turn/end reason: aborted）不算完成，不弹通知；
+//  - 等待用户审批（approval/asked 之后超过 approvalWaitMs 仍未 approval/decided）时弹通知。
 //  - 运行日志写到 $DSH_HOME/dsh-win-notify.log。
 
 import { spawn } from "node:child_process";
@@ -30,6 +31,12 @@ export const Config = z.object({
   body: z.string().default("任务已完成"),
   bodyError: z.string().default("任务出错"),
   maxPromptChars: z.number().default(64),
+  // 等待用户审批（sandbox 提权等）时的通知
+  approval: z.boolean().default(true),
+  // approval/asked 后等多久仍未决定才通知（毫秒）——快速自动决定的不打扰
+  approvalWaitMs: z.number().default(3000),
+  bodyApproval: z.string().default("等待用户审批"),
+  maxReasonChars: z.number().default(80),
 });
 
 const DEFAULTS = {
@@ -40,6 +47,10 @@ const DEFAULTS = {
   body: "任务已完成",
   bodyError: "任务出错",
   maxPromptChars: 64,
+  approval: true,
+  approvalWaitMs: 3000,
+  bodyApproval: "等待用户审批",
+  maxReasonChars: 80,
 };
 
 /** 注册过的 toast 身份（必须与开始菜单快捷方式的 AppUserModelID 一致）。 */
@@ -202,6 +213,35 @@ function lastUserPrompt(agent) {
   return "";
 }
 
+/**
+ * 该 approval/asked 是否已被 approval/decided 决定（按 id 匹配）。
+ * asked → decided 在会话日志中成对出现；id 为 UUID，decided 必在 asked 之后。
+ */
+export function isApprovalDecided(events, id) {
+  try {
+    for (const event of events ?? []) {
+      if (event?.type === "approval/decided" && event.data?.id === id) return true;
+    }
+  } catch { /* 读不到按未决定处理 */ }
+  return false;
+}
+
+/**
+ * 由 approval/asked 事件生成「等待审批」通知正文；无需通知时返回 null。
+ * 纯函数：调用方负责在等待阈值后先复核 isApprovalDecided 再生成正文。
+ */
+export function approvalNoticeBody(event, cfg) {
+  if (cfg?.approval === false) return null;
+  if (event?.type !== "approval/asked") return null;
+  const id = event.data?.id;
+  if (typeof id !== "string" || id === "") return null;
+  const toolName = String(event.data?.toolName ?? "").trim() || "未知工具";
+  const reason = typeof event.data?.reason === "string" ? event.data.reason.trim() : "";
+  const parts = [`${cfg.bodyApproval}：${toolName}`];
+  if (reason !== "") parts.push(truncate(reason, Math.max(1, Number(cfg.maxReasonChars) || 80)));
+  return parts.join(" · ");
+}
+
 /** 生成弹 Toast 的 PowerShell 脚本（WinRT ToastNotification，注册身份）。 */
 function toastScript(title, body, sound) {
   const src = Object.hasOwn(SOUNDS, sound) ? SOUNDS[sound] : SOUNDS.default;
@@ -305,6 +345,42 @@ export function apply(ctx, config = {}) {
     showToast(ctx, cfg, cfg.title, text);
   };
 
+  /** approvalId -> 防抖定时器；asked 后超过 approvalWaitMs 仍未 decided 才弹「等待审批」。 */
+  const pendingApprovals = new Map();
+
+  const disposeApprovalWatch = ctx.on("session/event", (session, event) => {
+    if (!cfg.approval) return;
+    try {
+      if (event?.type === "approval/asked") {
+        const id = event.data?.id;
+        if (typeof id !== "string" || id === "") return;
+        if (pendingApprovals.has(id)) return;
+        const waitMs = Math.max(0, Number(cfg.approvalWaitMs) || 0);
+        const timer = setTimeout(() => {
+          pendingApprovals.delete(id);
+          if (isApprovalDecided(session?.events ?? [], id)) return; // 阈值内已被决定（或策略 never/无应答方），不打扰
+          const body = approvalNoticeBody(event, cfg);
+          if (body) showToast(ctx, cfg, cfg.title, body);
+        }, waitMs);
+        pendingApprovals.set(id, timer);
+      } else if (event?.type === "approval/decided") {
+        const id = event.data?.id;
+        if (typeof id !== "string") return;
+        const timer = pendingApprovals.get(id);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          pendingApprovals.delete(id);
+        }
+      }
+    } catch { /* 通知失败不影响宿主 */ }
+  });
+
+  ctx.on("dispose", () => {
+    disposeApprovalWatch?.();
+    for (const timer of pendingApprovals.values()) clearTimeout(timer);
+    pendingApprovals.clear();
+  });
+
   ctx.on("agent/status", ({ status, agent }) => {
     if (status === "running") {
       runningSince.set(agent, Date.now());
@@ -326,7 +402,7 @@ export function apply(ctx, config = {}) {
     notify(agent, cfg.body);
   });
 
-  log(`apply: enabled, sound=${cfg.sound}`);
+  log(`apply: enabled, sound=${cfg.sound}, approval=${cfg.approval}, approvalWaitMs=${cfg.approvalWaitMs}`);
   void ensureRegistered(ctx); // 激活即注册，不阻塞
-  ctx.logger.info(`dsh-win-notify: 已启用（sound=${cfg.sound}, onError=${cfg.onError}）`);
+  ctx.logger.info(`dsh-win-notify: 已启用（sound=${cfg.sound}, onError=${cfg.onError}, approval=${cfg.approval}）`);
 }
