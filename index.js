@@ -41,6 +41,12 @@ export const Config = z.object({
   approvalWaitMs: z.number().default(3000),
   bodyApproval: z.string().default("等待用户审批"),
   maxReasonChars: z.number().default(80),
+  // 等待用户回复（ask_user_question 提问）时的通知
+  question: z.boolean().default(true),
+  // 提问后等多久仍未被回答才通知（毫秒）
+  questionWaitMs: z.number().default(3000),
+  bodyQuestion: z.string().default("等待用户回复"),
+  maxQuestionChars: z.number().default(80),
 });
 
 const DEFAULTS = {
@@ -57,6 +63,10 @@ const DEFAULTS = {
   approvalWaitMs: 3000,
   bodyApproval: "等待用户审批",
   maxReasonChars: 80,
+  question: true,
+  questionWaitMs: 3000,
+  bodyQuestion: "等待用户回复",
+  maxQuestionChars: 80,
 };
 
 /** 注册过的 toast 身份（必须与开始菜单快捷方式的 AppUserModelID 一致）。 */
@@ -369,10 +379,24 @@ export function apply(ctx, config = {}) {
   /** approvalId -> 防抖定时器；asked 后超过 approvalWaitMs 仍未 decided 才弹「等待审批」。 */
   const pendingApprovals = new Map();
 
+  /** 从 ask_user_question 的 tool/call 参数里取第一条问题的文本。 */
+  const questionTextOf = (event) => {
+    try {
+      const args = JSON.parse(event?.data?.arguments ?? "{}");
+      const q = Array.isArray(args.questions) ? args.questions[0] : null;
+      if (typeof q?.question === "string" && q.question.trim() !== "") return q.question.trim();
+      if (typeof q?.header === "string" && q.header.trim() !== "") return q.header.trim();
+    } catch { /* 忽略 */ }
+    return "";
+  };
+
+  /** callId -> 定时器；ask_user_question 后超过 questionWaitMs 仍未收到 tool/result 才弹「等待用户回复」。 */
+  const pendingQuestions = new Map();
+
   const disposeApprovalWatch = ctx.on("session/event", (session, event) => {
-    if (!cfg.approval) return;
     try {
       if (event?.type === "approval/asked") {
+        if (!cfg.approval) return;
         const id = event.data?.id;
         if (typeof id !== "string" || id === "") return;
         if (pendingApprovals.has(id)) return;
@@ -392,6 +416,27 @@ export function apply(ctx, config = {}) {
           clearTimeout(timer);
           pendingApprovals.delete(id);
         }
+      } else if (event?.type === "tool/call" && event.data?.name === "ask_user_question") {
+        if (!cfg.question) return;
+        const callId = event.data?.callId;
+        if (typeof callId !== "string" || callId === "") return;
+        if (pendingQuestions.has(callId)) return;
+        const text = questionTextOf(event) || cfg.bodyQuestion;
+        const waitMs = Math.max(0, Number(cfg.questionWaitMs) || 0);
+        const timer = setTimeout(() => {
+          pendingQuestions.delete(callId);
+          showToast(ctx, cfg, cfg.title, `${cfg.bodyQuestion}：${truncate(text, Math.max(1, Number(cfg.maxQuestionChars) || 80))}`, launchFor(session));
+        }, waitMs);
+        pendingQuestions.set(callId, timer);
+      } else if (event?.type === "tool/result") {
+        if (!cfg.question) return;
+        const callId = event.data?.message?.source?.callId;
+        if (typeof callId !== "string") return;
+        const timer = pendingQuestions.get(callId);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          pendingQuestions.delete(callId);
+        }
       }
     } catch { /* 通知失败不影响宿主 */ }
   });
@@ -400,6 +445,8 @@ export function apply(ctx, config = {}) {
     disposeApprovalWatch?.();
     for (const timer of pendingApprovals.values()) clearTimeout(timer);
     pendingApprovals.clear();
+    for (const timer of pendingQuestions.values()) clearTimeout(timer);
+    pendingQuestions.clear();
   });
 
   ctx.on("agent/status", ({ status, agent }) => {
