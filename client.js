@@ -14,7 +14,7 @@ window.__ModuleLoader__.load({
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
 		const name = "win-notify-deeplink";
-		const inject = [];
+		const inject = ["sessions"];
 
 		/** 从当前 URL 读取 session 参数（不存在则返回 undefined）。 */
 		function targetSessionId() {
@@ -37,7 +37,7 @@ window.__ModuleLoader__.load({
 
 		/** 会话列表就绪且目标会话存在时执行跳转；成功返回 true。 */
 		function tryOpen(ctx, sessionId) {
-			const sessions = ctx.get("sessions");
+			const sessions = ctx.sessions ?? ctx.get("sessions");
 			if (sessions === void 0) return false;
 			let snapshot;
 			try {
@@ -62,43 +62,69 @@ window.__ModuleLoader__.load({
 			const origin = window.location.origin;
 			/** 每个标签页一个稳定 id（页面生命周期内不变），宿主按客户端分组。 */
 			const clientId = typeof crypto.randomUUID === "function" ? crypto.randomUUID() : String(Math.random()).slice(2);
-			/** 每次上报实时读取当前选中会话（列表可能在插件订阅前就已就绪）。 */
-			const currentSession = () => {
-				const sessions = ctx.get("sessions");
+			/** 以 GUI 持久化的当前选择为准；运行时快照仅作读取失败时的备用。 */
+			const persistedSessionId = () => {
 				try {
-					const snapshot = sessions?.list?.getSnapshot();
-					return typeof snapshot?.current === "string" ? snapshot.current : "";
+					const raw = window.localStorage?.getItem("dsh.sessions.current");
+					const sessionId = raw === null || raw === "" ? "" : JSON.parse(raw)?.sessionId;
+					return typeof sessionId === "string" && sessionId !== "" ? sessionId : "";
 				} catch {
 					return "";
 				}
 			};
+			const currentSession = () => {
+				const sessions = ctx.sessions ?? ctx.get("sessions");
+				try {
+					const snapshot = sessions?.list?.getSnapshot();
+					const live = typeof snapshot?.current === "string" ? snapshot.current : "";
+					return persistedSessionId() || live;
+				} catch {
+					return "";
+				}
+			};
+			// 会话列表在流式事件期间会频繁刷新；状态未变时最多每 8 秒上报一次，
+			// 仍比宿主 25 秒 TTL 更快，同时不会因每个 token 产生请求风暴。
+			let lastReportKey = "";
+			let lastReportAt = 0;
 			const push = () => {
 				const focused = (document.visibilityState ?? "visible") === "visible" && document.hasFocus();
-				fetch(origin + "/dsh-win-notify/focus?focused=" + (focused ? "1" : "0") + "&session=" + encodeURIComponent(currentSession()) + "&client=" + encodeURIComponent(clientId), {
+				const sessionId = currentSession();
+				const key = (focused ? "1" : "0") + "\u0000" + sessionId;
+				const now = Date.now();
+				if (key === lastReportKey && now - lastReportAt < 8000) return;
+				lastReportKey = key;
+				lastReportAt = now;
+				fetch(origin + "/dsh-win-notify/focus?focused=" + (focused ? "1" : "0") + "&session=" + encodeURIComponent(sessionId) + "&client=" + encodeURIComponent(clientId), {
 					method: "POST",
 					keepalive: true,
-				}).catch(() => {});
+				}).catch(() => {
+					if (lastReportKey === key) lastReportAt = 0;
+				});
 			};
 			const onState = () => push();
-			document.addEventListener("visibilitychange", onState);
-			window.addEventListener("focus", onState);
-			window.addEventListener("blur", onState);
-			let unsubscribe;
-			const sessions = ctx.get("sessions");
-			if (sessions !== undefined && typeof sessions.list?.subscribe === "function") {
-				try {
-					unsubscribe = sessions.list.subscribe(() => push());
-				} catch { /* 忽略 */ }
-			}
-			const heartbeat = setInterval(push, 10000);
-			push();
+			// Cordis 在注册 effect 时立即执行回调，并只在卸载时调用其返回的 disposer。
+			// 所有监听器与心跳必须在 effect 内创建，避免刚创建就被清理。
 			ctx.effect(() => {
-				document.removeEventListener("visibilitychange", onState);
-				window.removeEventListener("focus", onState);
-				window.removeEventListener("blur", onState);
-				if (unsubscribe !== undefined) try { unsubscribe(); } catch { /* 忽略 */ }
-				clearInterval(heartbeat);
-			});
+				document.addEventListener("visibilitychange", onState);
+				window.addEventListener("focus", onState);
+				window.addEventListener("blur", onState);
+				let unsubscribe;
+				const sessions = ctx.sessions ?? ctx.get("sessions");
+				if (sessions !== undefined && typeof sessions.list?.subscribe === "function") {
+					try {
+						unsubscribe = sessions.list.subscribe(() => push());
+					} catch { /* 忽略 */ }
+				}
+				const heartbeat = setInterval(push, 10000);
+				push();
+				return () => {
+					document.removeEventListener("visibilitychange", onState);
+					window.removeEventListener("focus", onState);
+					window.removeEventListener("blur", onState);
+					if (unsubscribe !== undefined) try { unsubscribe(); } catch { /* 忽略 */ }
+					clearInterval(heartbeat);
+				};
+			}, "dsh-win-notify: focus reporting");
 		}
 
 		function apply(ctx) {
