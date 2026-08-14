@@ -6,8 +6,8 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plug
 - Notifies when an agent turn completes (running → idle)
 - Shows the last user prompt in the notification body
 - Also notifies on task errors (configurable)
-- Also notifies when an agent is **waiting for user approval** (sandbox
-escalation etc.), after a configurable delay — quickly auto-decided requests stay quiet
+- **Click the notification to open the GUI and jump straight to that session** (deep link via `?session=<id>`)
+- Also notifies while waiting for user approval on sandbox/permission requests (configurable)
 - Tasks you manually stop are **not** treated as completed — no notification
 - Pure PowerShell 5.1 (built into Windows) — no extra dependencies
 
@@ -46,14 +46,14 @@ config in the profile's `cordis.patch.yml`:
     enabled: true          # enable the plugin (default true)
     sound: default         # default | reminder | sms | alarm | silent
     onError: true          # also notify on task errors (default true)
+    openOnClick: true      # click to open the GUI at that session (default true)
+    baseUrl: ''            # custom GUI root URL (default: auto from webServer port)
+    approval: true         # notify while waiting for user approval (default true)
+    approvalWaitMs: 3000   # how long an approval may pend before notifying
     title: 'DeepSeek Harness'
     body: '任务已完成'
     bodyError: '任务出错'
     maxPromptChars: 64
-    approval: true         # notify when waiting for user approval (default true)
-    approvalWaitMs: 3000   # notify only if still undecided after this delay (ms)
-    bodyApproval: '等待用户审批'
-    maxReasonChars: 80     # max length of the approval reason shown
 ```
 
 ## How it works
@@ -77,14 +77,12 @@ config in the profile's `cordis.patch.yml`:
    `ToastNotification` with an `ms-winsoundevent` audio element, so Chinese
    text is never garbled. If registration fails, it falls back to a
    `NotifyIcon` balloon.
-4. **Approval waiting.** When the harness asks the user to approve an action
-   (sandbox escalation etc.), the session log records `approval/asked`;
-   the matching `approval/decided` closes it. The plugin listens on the host
-   plane for `session/event`: after `approvalWaitMs` (default 3000 ms) it
-   checks whether the ask is still undecided and, if so, shows a
-   "等待用户审批" toast with the tool name and the approval reason.
-   Asks that get decided within the delay (no answerer / `never` policy /
-   quick user response) never trigger a notification.
+4. **Click-to-open.** The toast carries `activationType="protocol"` with a
+   `launch` URL (`<gui>/?session=<id>`). Clicking opens the default browser at
+   the GUI; a small client plugin (`client.js`, declared via `dsh.client`)
+   reads the `session` parameter, calls `sessions.open(id)`, and strips the
+   parameter so a refresh does not re-trigger. Requires the browser page to be
+   loaded after the plugin row is added.
 
 ## Troubleshooting
 

@@ -31,6 +31,10 @@ export const Config = z.object({
   body: z.string().default("任务已完成"),
   bodyError: z.string().default("任务出错"),
   maxPromptChars: z.number().default(64),
+  // 点击通知时用浏览器打开 GUI 并跳转到对应会话
+  openOnClick: z.boolean().default(true),
+  // 自定义 GUI 根地址（默认自动取 webServer 的端口，本机用 127.0.0.1）
+  baseUrl: z.string().default(""),
   // 等待用户审批（sandbox 提权等）时的通知
   approval: z.boolean().default(true),
   // approval/asked 后等多久仍未决定才通知（毫秒）——快速自动决定的不打扰
@@ -47,6 +51,8 @@ const DEFAULTS = {
   body: "任务已完成",
   bodyError: "任务出错",
   maxPromptChars: 64,
+  openOnClick: true,
+  baseUrl: null,
   approval: true,
   approvalWaitMs: 3000,
   bodyApproval: "等待用户审批",
@@ -242,19 +248,23 @@ export function approvalNoticeBody(event, cfg) {
   return parts.join(" · ");
 }
 
-/** 生成弹 Toast 的 PowerShell 脚本（WinRT ToastNotification，注册身份）。 */
-function toastScript(title, body, sound) {
+/** 生成弹 Toast 的 PowerShell 脚本（WinRT ToastNotification，注册身份）。
+*  @param launch - 可选点击跳转 URL：点击通知后 Windows 用默认浏览器打开它。 */
+function toastScript(title, body, sound, launch) {
   const src = Object.hasOwn(SOUNDS, sound) ? SOUNDS[sound] : SOUNDS.default;
   const audio = src === null
     ? '<audio silent="true" />'
     : `<audio src="${escapeXml(src)}" />`;
   const textTitle = escapeXml(title);
   const textBody = escapeXml(body);
+  const activation = launch === void 0 || launch === ""
+    ? ""
+    : ` activationType="protocol" launch="${escapeXml(launch)}"`;
   return [
     "$ErrorActionPreference = 'Stop'",
     "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null",
     "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null",
-    `$xmlText = '<toast duration="long"><visual><binding template="ToastGeneric"><text>${textTitle}</text><text>${textBody}</text></binding></visual>${audio}</toast>'`,
+    `$xmlText = '<toast${activation} duration="long"><visual><binding template="ToastGeneric"><text>${textTitle}</text><text>${textBody}</text></binding></visual>${audio}</toast>'`,
     "$doc = New-Object Windows.Data.Xml.Dom.XmlDocument",
     "$doc.LoadXml($xmlText)",
     "$toast = New-Object Windows.UI.Notifications.ToastNotification $doc",
@@ -313,15 +323,15 @@ function ensureRegistered(ctx) {
   return registrationReady;
 }
 
-function showToast(ctx, cfg, title, body) {
+function showToast(ctx, cfg, title, body, launch) {
   if (!existsSync(PS5)) {
     ctx.logger.warn("dsh-win-notify: 找不到 powershell.exe，无法发送系统通知");
     return;
   }
   const useToast = (registered) => {
     if (registered) {
-      log(`toast shown via registered identity: ${title} | ${body}`);
-      runPowerShell(ctx, PS5, toastScript(title, body, cfg.sound), undefined, "toast");
+      log(`toast shown via registered identity: ${title} | ${body} | launch=${launch ?? ""}`);
+      runPowerShell(ctx, PS5, toastScript(title, body, cfg.sound, launch), undefined, "toast");
     } else if (process.platform === "win32") {
       log(`toast shown via balloon fallback: ${title} | ${body}`);
       runPowerShell(ctx, "pwsh", balloonScript(title, body), undefined, "balloon");
@@ -339,10 +349,21 @@ export function apply(ctx, config = {}) {
   /** agent -> 开始运行的时间戳；仅在 running→idle 且确实运行过时通知。 */
   const runningSince = new Map();
 
+  /** 点击跳转地址：GUI 根地址 + ?session=<会话ID>。subject 为 agent 或 session。 */
+  const launchFor = (subject) => {
+    if (!cfg.openOnClick) return void 0;
+    const session = subject?.session ?? subject;
+    const sessionId = session?.id;
+    if (typeof sessionId !== "string" || sessionId === "") return void 0;
+    const server = ctx.get("webServer");
+    const base = cfg.baseUrl ? cfg.baseUrl : `http://127.0.0.1:${server?.port ?? 3080}`;
+    return `${base.replace(/\/$/, "")}/?session=${encodeURIComponent(sessionId)}`;
+  };
+
   const notify = (agent, body) => {
     const prompt = truncate(lastUserPrompt(agent), cfg.maxPromptChars);
     const text = prompt ? `${body}：${prompt}` : body;
-    showToast(ctx, cfg, cfg.title, text);
+    showToast(ctx, cfg, cfg.title, text, launchFor(agent));
   };
 
   /** approvalId -> 防抖定时器；asked 后超过 approvalWaitMs 仍未 decided 才弹「等待审批」。 */
@@ -360,7 +381,7 @@ export function apply(ctx, config = {}) {
           pendingApprovals.delete(id);
           if (isApprovalDecided(session?.events ?? [], id)) return; // 阈值内已被决定（或策略 never/无应答方），不打扰
           const body = approvalNoticeBody(event, cfg);
-          if (body) showToast(ctx, cfg, cfg.title, body);
+          if (body) showToast(ctx, cfg, cfg.title, body, launchFor(session));
         }, waitMs);
         pendingApprovals.set(id, timer);
       } else if (event?.type === "approval/decided") {
