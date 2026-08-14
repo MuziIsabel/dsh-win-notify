@@ -15,8 +15,8 @@
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, appendFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, appendFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import z from "@deepseek-ai/schemastery";
@@ -85,7 +85,7 @@ const SHORTCUT_NAME = "DeepSeek.lnk";
 const OLD_SHORTCUT_NAME = "dsh-win-notify.lnk";
 const APP_DIR_NAME = "DeepSeek"; // %LOCALAPPDATA%\DeepSeek
 const STUB_EXE = "DeepSeek.exe";
-const STUB_VERSION = "3";
+const STUB_VERSION = "6";
 const ACTIVATION_SCHEME = "dsh-win-notify";
 const ICON_FILE = "DeepSeek.ico";
 /** 每个宿主进程的激活密钥；仅 Toast 的本地协议处理器持有。 */
@@ -137,6 +137,9 @@ const ACTIVATION_STUB_CS = String.raw`using System;
 using System.Diagnostics;
 using System.Net;
 using System.Text;
+using System.Threading;
+using System.Runtime.InteropServices;
+using System.Windows.Automation;
 
 internal sealed class TimedWebClient : WebClient
 {
@@ -183,6 +186,145 @@ internal static class Program
         try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); } catch { }
     }
 
+    private static string JsonAsciiValue(string json, string name)
+    {
+        if (String.IsNullOrEmpty(json) || String.IsNullOrEmpty(name)) return "";
+        string prefix = "\"" + name + "\":\"";
+        int start = json.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
+        if (start < 0) return "";
+        start += prefix.Length;
+        int end = json.IndexOf('\"', start);
+        return end < start ? "" : json.Substring(start, end - start);
+    }
+
+    private static string DecodeBase64Url(string value)
+    {
+        try
+        {
+            string text = (value ?? "").Replace('-', '+').Replace('_', '/');
+            while ((text.Length % 4) != 0) text += "=";
+            return Encoding.UTF8.GetString(Convert.FromBase64String(text));
+        }
+        catch { return ""; }
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr hWnd);
+
+    private static bool IsChromiumWindow(AutomationElement window)
+    {
+        try
+        {
+            string name = Process.GetProcessById(window.Current.ProcessId).ProcessName;
+            return String.Equals(name, "chrome", StringComparison.OrdinalIgnoreCase)
+                || String.Equals(name, "msedge", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    private static bool MatchesTabTitle(string actual, string expected)
+    {
+        if (String.IsNullOrEmpty(actual) || String.IsNullOrEmpty(expected)) return false;
+        return String.Equals(actual, expected, StringComparison.Ordinal)
+            || actual.StartsWith(expected + " - ", StringComparison.Ordinal);
+    }
+
+    // GUI tab titles always end with the app name; use it as a race-proof fallback marker.
+    private const string AppTitleMarker = "DeepSeek Harness";
+
+    private static void BringBrowserWindowForward(AutomationElement window)
+    {
+        try
+        {
+            int handle = window.Current.NativeWindowHandle;
+            if (handle == 0) return;
+            // SW_RESTORE un-maximizes a maximized window; only restore minimized ones.
+            IntPtr pointer = new IntPtr(handle);
+            if (IsIconic(pointer)) ShowWindow(pointer, 9); // SW_RESTORE
+            SetForegroundWindow(pointer);
+        }
+        catch { }
+    }
+
+    private static bool SelectTabElement(AutomationElement tab)
+    {
+        object pattern;
+        if (tab.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pattern))
+            ((SelectionItemPattern)pattern).Select();
+        else
+            tab.SetFocus();
+        return true;
+    }
+
+    private static bool SelectTabInWindow(AutomationElement window, string title)
+    {
+        try
+        {
+            AutomationElementCollection tabs = window.FindAll(
+                TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TabItem));
+            AutomationElement fallback = null;
+            foreach (AutomationElement tab in tabs)
+            {
+                string name = tab.Current.Name ?? "";
+                if (title.Length > 0 && MatchesTabTitle(name, title)) return SelectTabElement(tab);
+                if (fallback == null && name.IndexOf(AppTitleMarker, StringComparison.Ordinal) >= 0) fallback = tab;
+            }
+            // In-place session switches rename the tab before we enumerate it; any tab
+            // carrying the app marker is still the GUI tab that handled the activation.
+            if (fallback != null) return SelectTabElement(fallback);
+        }
+        catch { }
+        return false;
+    }
+
+    // Browser page-side focus is restricted; try the current Chromium window first.
+    // Any failure leaves the already-switched session intact and preserves HTTP fallback.
+    private static void ActivateBrowserTab(string title)
+    {
+        if (String.IsNullOrEmpty(title)) return;
+        try
+        {
+            IntPtr foreground = GetForegroundWindow();
+            if (foreground != IntPtr.Zero)
+            {
+                AutomationElement current = AutomationElement.FromHandle(foreground);
+                if (current != null && IsChromiumWindow(current))
+                {
+                    BringBrowserWindowForward(current);
+                    if (SelectTabInWindow(current, title)) return;
+                }
+            }
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                AutomationElementCollection windows = AutomationElement.RootElement.FindAll(
+                    TreeScope.Children,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Window));
+                foreach (AutomationElement window in windows)
+                {
+                    if (!IsChromiumWindow(window)) continue;
+                    if (window.Current.NativeWindowHandle == foreground.ToInt32()) continue;
+                    // Select a matching tab exposed by a background window's accessibility tree.
+                    if (!SelectTabInWindow(window, title)) continue;
+                    BringBrowserWindowForward(window);
+                    return;
+                }
+                Thread.Sleep(120);
+            }
+        }
+        catch { }
+    }
+
+    [STAThread]
     public static void Main(string[] args)
     {
         if (args == null || args.Length == 0) return;
@@ -198,6 +340,7 @@ internal static class Program
         string baseUrl = baseText.TrimEnd('/');
         string browserUrl = baseUrl + "/?session=" + Uri.EscapeDataString(sessionId);
         bool handled = false;
+        string focusTitle = "";
         try
         {
             string endpoint = baseUrl + "/dsh-win-notify/activate?session=" + Uri.EscapeDataString(sessionId)
@@ -208,10 +351,16 @@ internal static class Program
                 client.Encoding = Encoding.UTF8;
                 string response = client.UploadString(endpoint, "POST", "");
                 handled = response.IndexOf("\"handled\":true", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (handled) focusTitle = DecodeBase64Url(JsonAsciiValue(response, "focus"));
             }
         }
         catch { }
-        if (!handled) OpenBrowser(browserUrl);
+        if (handled)
+        {
+            ActivateBrowserTab(focusTitle);
+            return;
+        }
+        OpenBrowser(browserUrl);
     }
 }`;
 
@@ -229,9 +378,11 @@ function registrationScript() {
     "if ($needsStub) {",
     "  $tmp = Join-Path $appDir 'DeepSeek.next.exe'",
     "  if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp -Force }",
+    "  $runtime = [Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()",
+    "  $automationRefs = @((Join-Path $runtime 'WPF\UIAutomationClient.dll'), (Join-Path $runtime 'WPF\UIAutomationTypes.dll'))",
     "  Add-Type -TypeDefinition @'",
     ACTIVATION_STUB_CS,
-    "'@ -OutputAssembly $tmp -OutputType WindowsApplication",
+    "'@ -OutputAssembly $tmp -OutputType WindowsApplication -ReferencedAssemblies $automationRefs",
     "  $replaced = $false",
     "  $replaceAttempts = 0",
     "  do {",
@@ -293,17 +444,43 @@ function registrationScript() {
 }
 
 /** 启动一个独立的 PowerShell 进程执行脚本（fire-and-forget）。 */
+const MAX_INLINE_ENCODED_COMMAND_CHARS = 24000;
 function runPowerShell(ctx, executable, script, onDone, label) {
   const encoded = Buffer.from(script, "utf16le").toString("base64");
+  let scriptPath = "";
+  let args;
+  try {
+    if (encoded.length <= MAX_INLINE_ENCODED_COMMAND_CHARS) {
+      args = ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded];
+    } else {
+      // Windows has a ~32K command-line ceiling. Keep large registration C# out
+      // of argv, preserving Unicode with a UTF-16LE BOM script file instead.
+      scriptPath = join(tmpdir(), "dsh-win-notify-" + process.pid + "-" + randomBytes(8).toString("hex") + ".ps1");
+      writeFileSync(scriptPath, "\ufeff" + script, "utf16le");
+      args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath];
+      log("large PowerShell script staged: " + (label ?? "unnamed"));
+    }
+  } catch (error) {
+    log("stage fail " + label + ": " + error.message);
+    ctx.logger.warn("dsh-win-notify: 无法准备通知进程脚本: " + error.message);
+    onDone?.(false, "");
+    return;
+  }
+  const cleanup = () => {
+    if (scriptPath === "") return;
+    try { unlinkSync(scriptPath); } catch { /* 临时脚本可由系统清理 */ }
+    scriptPath = "";
+  };
   let child;
   try {
-    child = spawn(executable, ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+    child = spawn(executable, args, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
   } catch (error) {
-    log(`spawn fail ${label}: ${error.message}`);
-    ctx.logger.warn(`dsh-win-notify: 无法启动通知进程 ${executable}: ${error.message}`);
+    cleanup();
+    log("spawn fail " + label + ": " + error.message);
+    ctx.logger.warn("dsh-win-notify: 无法启动通知进程 " + executable + ": " + error.message);
     onDone?.(false, "");
     return;
   }
@@ -314,14 +491,16 @@ function runPowerShell(ctx, executable, script, onDone, label) {
   let failed = false;
   child.on("error", (error) => {
     failed = true;
-    log(`process error ${label}: ${error.message}`);
-    ctx.logger.warn(`dsh-win-notify: 通知进程错误: ${error.message}`);
+    cleanup();
+    log("process error " + label + ": " + error.message);
+    ctx.logger.warn("dsh-win-notify: 通知进程错误: " + error.message);
     onDone?.(false, stderr, stdout);
   });
   child.on("exit", (code) => {
-    log(`exit ${label}: code=${code} stderr=${stderr.slice(0, 600).replace(/\\s+/g, " ")}`);
+    cleanup();
+    log("exit " + label + ": code=" + code + " stderr=" + stderr.slice(0, 600).replace(/\s+/g, " "));
     if (code !== 0 && !failed) {
-      ctx.logger.warn(`dsh-win-notify: 通知进程退出码 ${code}`);
+      ctx.logger.warn("dsh-win-notify: 通知进程退出码 " + code);
       onDone?.(false, stderr, stdout);
       return;
     }
@@ -337,7 +516,6 @@ function escapeXml(value) {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&apos;");
 }
-
 function truncate(text, max) {
   const t = String(text ?? "").replace(/\s+/g, " ").trim();
   if (t.length <= max) return t;
@@ -571,12 +749,17 @@ export function apply(ctx, config = {}) {
     });
     res.end(body);
   };
-  const settleActivation = (commandId, handled) => {
+  const focusTitle = (value) => typeof value === "string" ? value.trim().slice(0, 512) : "";
+  const focusToken = (title) => {
+    const value = focusTitle(title);
+    return value === "" ? "" : Buffer.from(value, "utf8").toString("base64url");
+  };
+  const settleActivation = (commandId, handled, title = "") => {
     const entry = activationAcks.get(commandId);
     if (entry === void 0) return false;
     activationAcks.delete(commandId);
     clearTimeout(entry.timer);
-    entry.resolve(handled);
+    entry.resolve({ handled, title: handled ? (focusTitle(entry.title) || focusTitle(title)) : "" });
     return true;
   };
   const finishPoll = (clientId, entry, value) => {
@@ -612,7 +795,7 @@ export function apply(ctx, config = {}) {
     candidates.sort((a, b) => Number(Boolean(b.view.focused)) - Number(Boolean(a.view.focused)) || Number(b.view.at) - Number(a.view.at));
     return candidates[0];
   };
-  const enqueueActivation = (clientId, sessionId) => {
+  const enqueueActivation = (clientId, sessionId, title = "") => {
     for (const [id, entry] of activationAcks) if (entry.clientId === clientId) settleActivation(id, false);
     const previous = queuedCommands.get(clientId);
     if (previous !== void 0) queuedCommands.delete(clientId);
@@ -622,7 +805,7 @@ export function apply(ctx, config = {}) {
         if (queuedCommands.get(clientId)?.id === command.id) queuedCommands.delete(clientId);
         settleActivation(command.id, false);
       }, ACTIVATION_ACK_WAIT_MS);
-      activationAcks.set(command.id, { clientId, resolve, timer });
+      activationAcks.set(command.id, { clientId, title: focusTitle(title), resolve, timer });
       queuedCommands.set(clientId, command);
       flushCommand(clientId);
     });
@@ -762,11 +945,12 @@ export function apply(ctx, config = {}) {
             const url = new URL(req.url ?? "/", "http://localhost");
             const focused = url.searchParams.get("focused") === "1";
             const sessionId = url.searchParams.get("session") ?? "";
+            const title = focusTitle(url.searchParams.get("title"));
             const clientId = url.searchParams.get("client") ?? "";
             if (!validId(clientId) || sessionId.length > 512) { res.writeHead(400); res.end(); return; }
             const previous = clientViews.get(clientId);
-            const changed = previous === void 0 || previous.focused !== focused || previous.sessionId !== sessionId;
-            clientViews.set(clientId, { focused, sessionId, at: Date.now() });
+            const changed = previous === void 0 || previous.focused !== focused || previous.sessionId !== sessionId || previous.title !== title;
+            clientViews.set(clientId, { focused, sessionId, title, at: Date.now() });
             if (changed) log("client view: client=" + clientId.slice(0, 8) + " focused=" + focused + " session=" + (sessionId || "(none)"));
             res.writeHead(204);
           } catch {
@@ -818,7 +1002,8 @@ export function apply(ctx, config = {}) {
             if (!validId(clientId) || !validId(commandId) || entry === void 0 || entry.clientId !== clientId) { res.writeHead(404); res.end(); return; }
             if (queuedCommands.get(clientId)?.id === commandId) queuedCommands.delete(clientId);
             const ok = url.searchParams.get("ok") === "1";
-            settleActivation(commandId, ok);
+            const title = focusTitle(url.searchParams.get("title"));
+            settleActivation(commandId, ok, title);
             log("direct activation ack: client=" + clientId.slice(0, 8) + " ok=" + ok);
             res.writeHead(204);
           } catch {
@@ -846,12 +1031,26 @@ export function apply(ctx, config = {}) {
               return;
             }
             if (target.view.focused === true && target.view.sessionId === sessionId) {
-              writeJson(res, 200, { handled: true });
+              writeJson(res, 200, { handled: true, focus: focusToken(target.view.title) });
               return;
             }
             log("direct activation queued: client=" + target.clientId.slice(0, 8) + " session=" + sessionId);
-            const handled = await enqueueActivation(target.clientId, sessionId);
-            writeJson(res, 200, { handled });
+            const result = await enqueueActivation(target.clientId, sessionId, target.view.title);
+            // 标签标题在会话切换并重新渲染后才更新；短暂等待客户端补报的新标题，
+            // 否则原生助手会拿着旧标题去找标签而落空（标题竞态）。
+            let title = result.title;
+            if (result.handled) {
+              const previous = focusTitle(result.title);
+              const deadline = Date.now() + 1000;
+              while (Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+                const view = clientViews.get(target.clientId);
+                if (view === void 0 || view.sessionId !== sessionId) continue;
+                const updated = focusTitle(view.title);
+                if (updated !== "" && updated !== previous) { title = updated; break; }
+              }
+            }
+            writeJson(res, 200, { handled: result.handled, focus: focusToken(title) });
           } catch {
             writeJson(res, 500, { handled: false });
           }

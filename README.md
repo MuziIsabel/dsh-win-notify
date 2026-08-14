@@ -6,7 +6,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plug
 - Notifies when a **top-level** agent turn completes (running → idle); subagent turns stay silent
 - Shows the last user prompt in the notification body
 - Also notifies on task errors (configurable)
-- **Click the notification to switch a live GUI tab in place** — no transient browser tab; only when no live GUI exists does it open a new one (deep link via `?session=<id>`)
+- **Click the notification to switch and foreground a live GUI tab in place** — no transient browser tab; only when no live GUI exists does it open a new one (deep link via `?session=<id>`)
 - Also notifies while waiting for user approval on sandbox/permission requests (configurable)
 - Also notifies when the agent asks you a question (`ask_user_question`) and waits for your reply (configurable)
 - **Focus-aware:** while the GUI page is focused and showing the session that triggered the event, that session's notifications are suppressed — no disturbance when you are already watching
@@ -89,12 +89,20 @@ config in the profile's `cordis.patch.yml`:
    `DeepSeek.exe` helper rather than a browser. It asks the local DSH server
    to deliver an `open-session` command to the most recently focused live GUI
    tab; that tab calls `sessions.open(id)` in place (no full-page refresh and
-   no new browser tab). If no live GUI acknowledges promptly, or the protocol
-   registration is unavailable, the helper safely falls back to the normal
-   `<gui>/?session=<id>` deep link; its `BroadcastChannel` handoff remains a
-   second fallback. The first custom-protocol click can require a one-time
-   browser/Windows confirmation. Non-loopback custom `baseUrl` values keep the
-   normal HTTP deep link for safety.
+   no new browser tab). After a successful acknowledgement, the helper makes a
+   best-effort Windows UI Automation selection of the matching Chrome/Edge tab,
+   so a click made while you are browsing another tab can bring the DSH tab to
+   the foreground. The helper matches the tab by its post-switch title, with a
+   race-proof app-name fallback, and only restores minimized browser windows —
+   maximized windows keep their state. Browser accessibility, elevation,
+   virtual-desktop, and focus-stealing policy can still prevent foregrounding;
+   in that case the session is nevertheless selected in the background. If no live GUI
+   acknowledges promptly, or the protocol registration is unavailable, the
+   helper safely falls back to the normal `<gui>/?session=<id>` deep link; its
+   `BroadcastChannel` handoff remains a second fallback. The first
+   custom-protocol click can require a one-time browser/Windows confirmation.
+   Non-loopback custom `baseUrl` values keep the normal HTTP deep link for
+   safety.
 
 ## Troubleshooting
 

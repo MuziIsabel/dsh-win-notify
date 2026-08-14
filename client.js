@@ -82,6 +82,13 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		// 各 effect 共享的“立即上报一次前台状态”触发器：会话切换后由激活轮询调用，
+		// 让宿主尽快拿到切换后的标签标题，供原生助手选择浏览器标签。
+		const viewPushListeners = new Set();
+		const requestViewPush = () => {
+			for (const push of viewPushListeners) try { push(); } catch { /* 忽略 */ }
+		};
+
 		/** 前台状态上报：页面聚焦且选中某会话时，宿主抑制该会话的通知。 */
 		function setupFocusReporting(ctx, clientId) {
 			const origin = window.location.origin;
@@ -112,12 +119,13 @@ window.__ModuleLoader__.load({
 			const push = () => {
 				const focused = (document.visibilityState ?? "visible") === "visible" && document.hasFocus();
 				const sessionId = currentSession();
-				const key = (focused ? "1" : "0") + "\u0000" + sessionId;
+				const title = String(document.title ?? "").slice(0, 512);
+				const key = (focused ? "1" : "0") + "\u0000" + sessionId + "\u0000" + title;
 				const now = Date.now();
 				if (key === lastReportKey && now - lastReportAt < 8000) return;
 				lastReportKey = key;
 				lastReportAt = now;
-				fetch(origin + "/dsh-win-notify/focus?focused=" + (focused ? "1" : "0") + "&session=" + encodeURIComponent(sessionId) + "&client=" + encodeURIComponent(clientId), {
+				fetch(origin + "/dsh-win-notify/focus?focused=" + (focused ? "1" : "0") + "&session=" + encodeURIComponent(sessionId) + "&title=" + encodeURIComponent(title) + "&client=" + encodeURIComponent(clientId), {
 					method: "POST",
 					keepalive: true,
 				}).catch(() => {
@@ -139,12 +147,14 @@ window.__ModuleLoader__.load({
 					} catch { /* 忽略 */ }
 				}
 				const heartbeat = setInterval(push, 10000);
+				viewPushListeners.add(push);
 				push();
 				return () => {
 					document.removeEventListener("visibilitychange", onState);
 					window.removeEventListener("focus", onState);
 					window.removeEventListener("blur", onState);
 					if (unsubscribe !== undefined) try { unsubscribe(); } catch { /* 忽略 */ }
+					viewPushListeners.delete(push);
 					clearInterval(heartbeat);
 				};
 			}, "dsh-win-notify: focus reporting");
@@ -182,9 +192,11 @@ window.__ModuleLoader__.load({
 				let controller;
 				let retryTimer;
 				let opening;
-				const acknowledge = (commandId, ok) => {
+				let viewPushTimers = [];
+				const acknowledge = (commandId, ok, title = "") => {
 					const url = origin + "/dsh-win-notify/ack?client=" + encodeURIComponent(clientId)
-						+ "&command=" + encodeURIComponent(commandId) + "&ok=" + (ok ? "1" : "0");
+						+ "&command=" + encodeURIComponent(commandId) + "&ok=" + (ok ? "1" : "0")
+						+ "&title=" + encodeURIComponent(String(title).slice(0, 512));
 					fetch(url, { method: "POST", keepalive: true, cache: "no-store" }).catch(() => {});
 				};
 				const stopOpening = (ok) => {
@@ -200,15 +212,17 @@ window.__ModuleLoader__.load({
 					stopOpening(false);
 					let settled = false;
 					let timer;
-					const finish = (ok) => {
+					const finish = (ok, title = "") => {
 						if (settled) return;
 						settled = true;
 						if (timer !== void 0) clearTimeout(timer);
 						if (opening?.id === command.id) opening = void 0;
-						acknowledge(command.id, ok);
+						acknowledge(command.id, ok, title);
 						if (ok) try { window.focus(); } catch { /* 浏览器可能拒绝非用户手势聚焦 */ }
+						// 标题在新会话渲染后才更新；分批补报让宿主拿到切换后的标签标题。
+						if (ok) for (const delay of [120, 300, 600, 900]) viewPushTimers.push(setTimeout(requestViewPush, delay));
 					};
-					const stop = openSessionWhenReady(ctx, command.sessionId, () => finish(true));
+					const stop = openSessionWhenReady(ctx, command.sessionId, () => finish(true, document.title));
 					if (!settled) {
 						timer = setTimeout(() => {
 							stop();
@@ -227,15 +241,11 @@ window.__ModuleLoader__.load({
 							cache: "no-store",
 							signal: currentController.signal,
 						});
-						if (!response.ok) {
-							retryDelay = 1000;
-							return;
-						}
+						if (!response.ok) { retryDelay = 1000; return; }
 						const payload = await response.json();
 						accept(payload?.command);
-					} catch {
-						retryDelay = 1000;
-					} finally {
+					} catch { retryDelay = 1000; }
+					finally {
 						if (controller === currentController) controller = void 0;
 						if (!stopped) retryTimer = setTimeout(poll, retryDelay);
 					}
@@ -245,11 +255,12 @@ window.__ModuleLoader__.load({
 					stopped = true;
 					if (controller !== void 0) controller.abort();
 					if (retryTimer !== void 0) clearTimeout(retryTimer);
+					for (const timer of viewPushTimers) clearTimeout(timer);
+					viewPushTimers = [];
 					stopOpening(false);
 				};
 			}, "dsh-win-notify: direct activation polling");
 		}
-
 		/** 为每个已打开的 GUI 标签监听来自新通知标签的会话交接请求。 */
 		function setupTabHandoff(ctx, tabId) {
 			if (typeof BroadcastChannel !== "function") return;
