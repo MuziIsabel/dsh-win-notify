@@ -93,8 +93,9 @@ config in the profile's `cordis.patch.yml`:
    best-effort Windows UI Automation selection of the matching Chrome/Edge tab,
    so a click made while you are browsing another tab can bring the DSH tab to
    the foreground. The helper matches the tab by its post-switch title, with a
-   race-proof app-name fallback, and only restores minimized browser windows —
-   maximized windows keep their state. Browser accessibility, elevation,
+   race-proof app-name fallback, and preserves maximized or normally sized
+   browser windows; only minimized windows are restored. Browser accessibility,
+   elevation,
    virtual-desktop, and focus-stealing policy can still prevent foregrounding;
    in that case the session is nevertheless selected in the background. If no live GUI
    acknowledges promptly, or the protocol registration is unavailable, the
