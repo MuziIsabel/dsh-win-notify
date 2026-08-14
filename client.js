@@ -57,7 +57,48 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		/** 前台状态上报：页面聚焦且选中某会话时，宿主抑制该会话的通知。 */
+		function setupFocusReporting(ctx) {
+			const origin = window.location.origin;
+			let currentId = "";
+			const push = () => {
+				const focused = (document.visibilityState ?? "visible") === "visible" && document.hasFocus();
+				fetch(origin + "/dsh-win-notify/focus?focused=" + (focused ? "1" : "0") + "&session=" + encodeURIComponent(currentId), {
+					method: "POST",
+					keepalive: true,
+				}).catch(() => {});
+			};
+			const onState = () => push();
+			document.addEventListener("visibilitychange", onState);
+			window.addEventListener("focus", onState);
+			window.addEventListener("blur", onState);
+			let unsubscribe;
+			const sessions = ctx.get("sessions");
+			if (sessions !== undefined && typeof sessions.list?.subscribe === "function") {
+				try {
+					unsubscribe = sessions.list.subscribe(() => {
+						let snapshot;
+						try { snapshot = sessions.list.getSnapshot(); } catch { return; }
+						const current = typeof snapshot?.current === "string" ? snapshot.current : "";
+						if (current !== currentId) { currentId = current; push(); }
+					});
+				} catch { /* 忽略 */ }
+			}
+			const heartbeat = setInterval(push, 10000);
+			push();
+			ctx.effect(() => {
+				document.removeEventListener("visibilitychange", onState);
+				window.removeEventListener("focus", onState);
+				window.removeEventListener("blur", onState);
+				if (unsubscribe !== undefined) try { unsubscribe(); } catch { /* 忽略 */ }
+				clearInterval(heartbeat);
+			});
+		}
+
 		function apply(ctx) {
+			// 前台状态上报始终启用（有无深链参数都上报）
+			setupFocusReporting(ctx);
+
 			const sessionId = targetSessionId();
 			if (sessionId === void 0) return;
 

@@ -47,6 +47,10 @@ export const Config = z.object({
   questionWaitMs: z.number().default(3000),
   bodyQuestion: z.string().default("等待用户回复"),
   maxQuestionChars: z.number().default(80),
+  // 页面在前台查看该会话时，抑制该会话的通知（避免打扰正在盯着 GUI 的用户）
+  suppressWhenVisible: z.boolean().default(true),
+  // 前台状态的保鲜期：客户端每 ~10 秒心跳一次，超时视为页面已关闭
+  visibilityTtlMs: z.number().default(25000),
 });
 
 const DEFAULTS = {
@@ -67,6 +71,8 @@ const DEFAULTS = {
   questionWaitMs: 3000,
   bodyQuestion: "等待用户回复",
   maxQuestionChars: 80,
+  suppressWhenVisible: true,
+  visibilityTtlMs: 25000,
 };
 
 /** 注册过的 toast 身份（必须与开始菜单快捷方式的 AppUserModelID 一致）。 */
@@ -83,6 +89,20 @@ function log(msg) {
   try { appendFileSync(LOG_FILE, `[${new Date().toISOString()}] pid=${process.pid} ${msg}\n`); } catch { /* 忽略日志错误 */ }
 }
 log("module loaded"); // 模块被 import 时立即记录
+
+/** 浏览器上报的前台状态：{ sessionId, focused } + 最近上报时间（模块级，多标签页以最后一次上报为准）。 */
+let clientView = null;
+let clientViewAt = 0;
+
+/** 该会话是否正被用户在前台查看（聚焦且选中）——是则不打扰。 */
+function suppressFor(sessionId, cfg) {
+  if (!cfg.suppressWhenVisible) return false;
+  if (clientView === null) return false;
+  const ttl = Math.max(5000, Number(cfg.visibilityTtlMs) || 25000);
+  if (Date.now() - clientViewAt > ttl) { clientView = null; return false; }
+  if (clientView.focused !== true) return false;
+  return typeof sessionId === "string" && sessionId !== "" && clientView.sessionId === sessionId;
+}
 
 /** ms-winsoundevent 声音映射；null 表示静音。 */
 const SOUNDS = {
@@ -333,7 +353,11 @@ function ensureRegistered(ctx) {
   return registrationReady;
 }
 
-function showToast(ctx, cfg, title, body, launch) {
+function showToast(ctx, cfg, title, body, launch, sessionId) {
+  if (suppressFor(sessionId, cfg)) {
+    log(`toast suppressed (session in foreground): ${title} | ${body}`);
+    return;
+  }
   if (!existsSync(PS5)) {
     ctx.logger.warn("dsh-win-notify: 找不到 powershell.exe，无法发送系统通知");
     return;
@@ -373,7 +397,7 @@ export function apply(ctx, config = {}) {
   const notify = (agent, body) => {
     const prompt = truncate(lastUserPrompt(agent), cfg.maxPromptChars);
     const text = prompt ? `${body}：${prompt}` : body;
-    showToast(ctx, cfg, cfg.title, text, launchFor(agent));
+    showToast(ctx, cfg, cfg.title, text, launchFor(agent), agent?.session?.id);
   };
 
   /** approvalId -> 防抖定时器；asked 后超过 approvalWaitMs 仍未 decided 才弹「等待审批」。 */
@@ -406,7 +430,7 @@ export function apply(ctx, config = {}) {
           pendingApprovals.delete(id);
           if (isApprovalDecided(session?.events ?? [], id)) return; // 阈值内已被决定（或策略 never/无应答方），不打扰
           const body = approvalNoticeBody(event, cfg);
-          if (body) showToast(ctx, cfg, cfg.title, body, launchFor(session));
+          if (body) showToast(ctx, cfg, cfg.title, body, launchFor(session), session?.id);
         }, waitMs);
         pendingApprovals.set(id, timer);
       } else if (event?.type === "approval/decided") {
@@ -431,7 +455,7 @@ export function apply(ctx, config = {}) {
         const waitMs = Math.max(0, Number(cfg.questionWaitMs) || 0);
         const timer = setTimeout(() => {
           pendingQuestions.delete(key);
-          showToast(ctx, cfg, cfg.title, `${cfg.bodyQuestion}：${truncate(text, Math.max(1, Number(cfg.maxQuestionChars) || 80))}`, launchFor(session));
+          showToast(ctx, cfg, cfg.title, `${cfg.bodyQuestion}：${truncate(text, Math.max(1, Number(cfg.maxQuestionChars) || 80))}`, launchFor(session), session?.id);
         }, waitMs);
         pendingQuestions.set(key, { timer, rootId });
       } else if (event?.type === "tool/result") {
@@ -478,6 +502,29 @@ export function apply(ctx, config = {}) {
     notify(agent, cfg.body);
   });
 
+  // 浏览器前台状态上报路由（页面聚焦 + 当前选中会话）——抑制前台会话的通知
+  const webServer = ctx.get("webServer");
+  if (webServer !== undefined && cfg.suppressWhenVisible) {
+    ctx.effect(() => webServer.register({
+      kind: "exact",
+      path: "/dsh-win-notify/focus",
+      handler: (req, res) => {
+        try {
+          const url = new URL(req.url ?? "/", "http://localhost");
+          const focused = url.searchParams.get("focused") === "1";
+          const sessionId = url.searchParams.get("session") ?? "";
+          const changed = clientView === null || clientView.focused !== focused || clientView.sessionId !== sessionId;
+          clientView = { focused, sessionId };
+          clientViewAt = Date.now();
+          if (changed) log("client view: focused=" + focused + " session=" + (sessionId || "(none)"));
+          res.writeHead(204);
+        } catch {
+          res.writeHead(400);
+        }
+        res.end();
+      }
+    }), "dsh-win-notify: focus report route");
+  }
   log(`apply: enabled, sound=${cfg.sound}, approval=${cfg.approval}, approvalWaitMs=${cfg.approvalWaitMs}`);
   void ensureRegistered(ctx); // 激活即注册，不阻塞
   ctx.logger.info(`dsh-win-notify: 已启用（sound=${cfg.sound}, onError=${cfg.onError}, approval=${cfg.approval}）`);

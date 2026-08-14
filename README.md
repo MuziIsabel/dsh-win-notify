@@ -9,6 +9,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plug
 - **Click the notification to open the GUI and jump straight to that session** (deep link via `?session=<id>`)
 - Also notifies while waiting for user approval on sandbox/permission requests (configurable)
 - Also notifies when the agent asks you a question (`ask_user_question`) and waits for your reply (configurable)
+- **Focus-aware:** while the GUI page is focused and showing the session that triggered the event, that session's notifications are suppressed — no disturbance when you are already watching
 - Tasks you manually stop are **not** treated as completed — no notification
 - Pure PowerShell 5.1 (built into Windows) — no extra dependencies
 
@@ -53,6 +54,8 @@ config in the profile's `cordis.patch.yml`:
     approvalWaitMs: 3000   # how long an approval may pend before notifying
     question: true         # notify while waiting for a user reply (default true)
     questionWaitMs: 3000   # how long a question may pend before notifying
+    suppressWhenVisible: true  # suppress notifications for the session you are actively viewing (default true)
+    visibilityTtlMs: 25000      # focus-state freshness window (client heartbeats every ~10s)
     title: 'DeepSeek Harness'
     body: '任务已完成'
     bodyError: '任务出错'
