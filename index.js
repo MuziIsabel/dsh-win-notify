@@ -379,11 +379,12 @@ export function apply(ctx, config = {}) {
   /** approvalId -> 防抖定时器；asked 后超过 approvalWaitMs 仍未 decided 才弹「等待审批」。 */
   const pendingApprovals = new Map();
 
-  /** 从 ask_user_question 的 tool/call 参数里取第一条问题的文本。 */
+  /** 从 ask_user_question 的工具调用事件里取第一条问题的文本（arguments 可能是对象或 JSON 字符串）。 */
   const questionTextOf = (event) => {
     try {
-      const args = JSON.parse(event?.data?.arguments ?? "{}");
-      const q = Array.isArray(args.questions) ? args.questions[0] : null;
+      let args = event?.data?.arguments;
+      if (typeof args === "string") { try { args = JSON.parse(args); } catch { args = {}; } }
+      const q = Array.isArray(args?.questions) ? args.questions[0] : null;
       if (typeof q?.question === "string" && q.question.trim() !== "") return q.question.trim();
       if (typeof q?.header === "string" && q.header.trim() !== "") return q.header.trim();
     } catch { /* 忽略 */ }
@@ -416,26 +417,33 @@ export function apply(ctx, config = {}) {
           clearTimeout(timer);
           pendingApprovals.delete(id);
         }
-      } else if (event?.type === "tool/call" && event.data?.name === "ask_user_question") {
+      } else if ((event?.type === "tool/call" || event?.type === "tool/code-dispatch-start") && event.data?.name === "ask_user_question") {
         if (!cfg.question) return;
-        const callId = event.data?.callId;
-        if (typeof callId !== "string" || callId === "") return;
-        if (pendingQuestions.has(callId)) return;
+        // code 模式：subCallId 唯一标识该次提问；原生工具：callId
+        const key = typeof event.data?.subCallId === "string" && event.data.subCallId !== ""
+          ? event.data.subCallId
+          : event.data?.callId;
+        if (typeof key !== "string" || key === "") return;
+        if (pendingQuestions.has(key)) return;
+        // 外层调用 id（提问是外层 run_code 的内部调度时，结果以 rootCallId 出现）
+        const rootId = typeof event.data?.rootCallId === "string" ? event.data.rootCallId : key;
         const text = questionTextOf(event) || cfg.bodyQuestion;
         const waitMs = Math.max(0, Number(cfg.questionWaitMs) || 0);
         const timer = setTimeout(() => {
-          pendingQuestions.delete(callId);
+          pendingQuestions.delete(key);
           showToast(ctx, cfg, cfg.title, `${cfg.bodyQuestion}：${truncate(text, Math.max(1, Number(cfg.maxQuestionChars) || 80))}`, launchFor(session));
         }, waitMs);
-        pendingQuestions.set(callId, timer);
+        pendingQuestions.set(key, { timer, rootId });
       } else if (event?.type === "tool/result") {
         if (!cfg.question) return;
         const callId = event.data?.message?.source?.callId;
         if (typeof callId !== "string") return;
-        const timer = pendingQuestions.get(callId);
-        if (timer !== undefined) {
-          clearTimeout(timer);
-          pendingQuestions.delete(callId);
+        // 提问所属调用的结果出现（或匹配提问自身 id）→ 用户已回复/已取消，撤销通知
+        for (const [qKey, entry] of pendingQuestions) {
+          if (entry.rootId === callId || qKey === callId) {
+            clearTimeout(entry.timer);
+            pendingQuestions.delete(qKey);
+          }
         }
       }
     } catch { /* 通知失败不影响宿主 */ }
@@ -445,7 +453,7 @@ export function apply(ctx, config = {}) {
     disposeApprovalWatch?.();
     for (const timer of pendingApprovals.values()) clearTimeout(timer);
     pendingApprovals.clear();
-    for (const timer of pendingQuestions.values()) clearTimeout(timer);
+    for (const entry of pendingQuestions.values()) clearTimeout(entry.timer);
     pendingQuestions.clear();
   });
 
