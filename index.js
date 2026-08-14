@@ -503,8 +503,13 @@ export function apply(ctx, config = {}) {
   });
 
   // 浏览器前台状态上报路由（页面聚焦 + 当前选中会话）——抑制前台会话的通知
-  const webServer = ctx.get("webServer");
-  if (webServer !== undefined && cfg.suppressWhenVisible) {
+  // 注意：本行无 inject，apply 时 webServer 服务可能尚未挂载——监听 internal/service 等待它出现再注册。
+  let focusRouteRegistered = false;
+  const registerFocusRoute = () => {
+    if (focusRouteRegistered || !cfg.suppressWhenVisible) return;
+    const webServer = ctx.get("webServer");
+    if (webServer === undefined) return;
+    focusRouteRegistered = true;
     ctx.effect(() => webServer.register({
       kind: "exact",
       path: "/dsh-win-notify/focus",
@@ -524,7 +529,14 @@ export function apply(ctx, config = {}) {
         res.end();
       }
     }), "dsh-win-notify: focus report route");
+  };
+  if (cfg.suppressWhenVisible) {
+    ctx.on("internal/service", registerFocusRoute);
+    registerFocusRoute();
+    const focusRetry = setTimeout(registerFocusRoute, 3000);
+    ctx.on("dispose", () => clearTimeout(focusRetry));
   }
+
   log(`apply: enabled, sound=${cfg.sound}, approval=${cfg.approval}, approvalWaitMs=${cfg.approvalWaitMs}`);
   void ensureRegistered(ctx); // 激活即注册，不阻塞
   ctx.logger.info(`dsh-win-notify: 已启用（sound=${cfg.sound}, onError=${cfg.onError}, approval=${cfg.approval}）`);
