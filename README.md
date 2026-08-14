@@ -6,7 +6,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plug
 - Notifies when an agent turn completes (running → idle)
 - Shows the last user prompt in the notification body
 - Also notifies on task errors (configurable)
-- **Click the notification to open the GUI and jump straight to that session** (deep link via `?session=<id>`)
+- **Click the notification to reuse an existing GUI tab and jump straight to that session**; when no matching tab exists, it opens a new one (deep link via `?session=<id>`)
 - Also notifies while waiting for user approval on sandbox/permission requests (configurable)
 - Also notifies when the agent asks you a question (`ask_user_question`) and waits for your reply (configurable)
 - **Focus-aware:** while the GUI page is focused and showing the session that triggered the event, that session's notifications are suppressed — no disturbance when you are already watching
@@ -83,12 +83,14 @@ config in the profile's `cordis.patch.yml`:
    `ToastNotification` with an `ms-winsoundevent` audio element, so Chinese
    text is never garbled. If registration fails, it falls back to a
    `NotifyIcon` balloon.
-4. **Click-to-open.** The toast carries `activationType="protocol"` with a
-   `launch` URL (`<gui>/?session=<id>`). Clicking opens the default browser at
-   the GUI; a small client plugin (`client.js`, declared via `dsh.client`)
-   reads the `session` parameter, calls `sessions.open(id)`, and strips the
-   parameter so a refresh does not re-trigger. Requires the browser page to be
-   loaded after the plugin row is added.
+4. **Click-to-open with tab reuse.** The toast carries `activationType="protocol"`
+   with a `launch` URL (`<gui>/?session=<id>`). The client plugin
+   (`client.js`, declared via `dsh.client`) uses a same-origin
+   `BroadcastChannel` to hand the target session to the most recently focused,
+   connected GUI tab. It then closes the transient tab when the browser allows;
+   with no live same-origin tab (or where the browser blocks closing it), the new
+   tab opens the session directly. The `session` parameter is stripped after a
+   successful local open so refreshes do not repeat it.
 
 ## Troubleshooting
 
