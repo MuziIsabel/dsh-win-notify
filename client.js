@@ -60,6 +60,8 @@ window.__ModuleLoader__.load({
 		/** 前台状态上报：页面聚焦且选中某会话时，宿主抑制该会话的通知。 */
 		function setupFocusReporting(ctx) {
 			const origin = window.location.origin;
+			/** 每个标签页一个稳定 id（页面生命周期内不变），宿主按客户端分组。 */
+			const clientId = typeof crypto.randomUUID === "function" ? crypto.randomUUID() : String(Math.random()).slice(2);
 			/** 每次上报实时读取当前选中会话（列表可能在插件订阅前就已就绪）。 */
 			const currentSession = () => {
 				const sessions = ctx.get("sessions");
@@ -72,7 +74,7 @@ window.__ModuleLoader__.load({
 			};
 			const push = () => {
 				const focused = (document.visibilityState ?? "visible") === "visible" && document.hasFocus();
-				fetch(origin + "/dsh-win-notify/focus?focused=" + (focused ? "1" : "0") + "&session=" + encodeURIComponent(currentSession()), {
+				fetch(origin + "/dsh-win-notify/focus?focused=" + (focused ? "1" : "0") + "&session=" + encodeURIComponent(currentSession()) + "&client=" + encodeURIComponent(clientId), {
 					method: "POST",
 					keepalive: true,
 				}).catch(() => {});
