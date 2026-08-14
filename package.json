@@ -1,6 +1,6 @@
 {
   "name": "dsh-win-notify",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "DSH plugin: Windows toast notification with sound when an agent task completes.",
   "type": "module",
   "main": "index.js",

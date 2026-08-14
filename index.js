@@ -14,6 +14,7 @@
 //  - 运行日志写到 $DSH_HOME/dsh-win-notify.log。
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -35,6 +36,8 @@ export const Config = z.object({
   openOnClick: z.boolean().default(true),
   // 自定义 GUI 根地址（默认自动取 webServer 的端口，本机用 127.0.0.1）
   baseUrl: z.string().default(""),
+  // 点击 Toast 时优先通过本地协议直接唤醒已有 GUI 标签（无标签时才打开浏览器）
+  directActivate: z.boolean().default(true),
   // 等待用户审批（sandbox 提权等）时的通知
   approval: z.boolean().default(true),
   // approval/asked 后等多久仍未决定才通知（毫秒）——快速自动决定的不打扰
@@ -63,6 +66,7 @@ const DEFAULTS = {
   maxPromptChars: 64,
   openOnClick: true,
   baseUrl: null,
+  directActivate: true,
   approval: true,
   approvalWaitMs: 3000,
   bodyApproval: "等待用户审批",
@@ -81,7 +85,11 @@ const SHORTCUT_NAME = "DeepSeek.lnk";
 const OLD_SHORTCUT_NAME = "dsh-win-notify.lnk";
 const APP_DIR_NAME = "DeepSeek"; // %LOCALAPPDATA%\DeepSeek
 const STUB_EXE = "DeepSeek.exe";
+const STUB_VERSION = "3";
+const ACTIVATION_SCHEME = "dsh-win-notify";
 const ICON_FILE = "DeepSeek.ico";
+/** 每个宿主进程的激活密钥；仅 Toast 的本地协议处理器持有。 */
+const ACTIVATION_TOKEN = randomBytes(24).toString("base64url");
 const PLUGIN_DIR = fileURLToPath(new URL(".", import.meta.url));
 const ICON_SOURCE = join(PLUGIN_DIR, "assets", ICON_FILE);
 const LOG_FILE = join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "dsh-win-notify.log");
@@ -124,20 +132,136 @@ const PS5 = join(
 /** C# 帮助类：给 .lnk 快捷方式写 AppUserModelID（IPropertyStore P/Invoke）。 */
 const PROPSTORE_CS = "using System;\nusing System.Runtime.InteropServices;\n\npublic static class PropStore\n{\n    private static readonly Guid IID_IPropertyStore = new Guid(\"886d8eeb-8cf2-4446-8d02-cdba1dbdcf99\");\n    private static readonly Guid PKEY_AppUserModel_ID = new Guid(\"9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3\");\n\n    [StructLayout(LayoutKind.Sequential)]\n    private struct PropertyKey { public Guid fmtid; public uint pid; }\n\n    [ComImport, Guid(\"886d8eeb-8cf2-4446-8d02-cdba1dbdcf99\"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]\n    private interface IPropertyStore\n    {\n        int GetCount(out uint cProps);\n        int GetAt(uint iProp, out PropertyKey pkey);\n        int GetValue(ref PropertyKey key, out IntPtr pv);\n        int SetValue(ref PropertyKey key, ref PropVariant pv);\n        int Commit();\n    }\n\n    [StructLayout(LayoutKind.Explicit)]\n    private struct PropVariant\n    {\n        [FieldOffset(0)] public ushort vt;\n        [FieldOffset(8)] public IntPtr ptr;\n    }\n\n    [DllImport(\"shell32.dll\", CharSet = CharSet.Unicode)]\n    private static extern int SHGetPropertyStoreFromParsingName(string pszPath, IntPtr pbc, uint flags, ref Guid riid, out IntPtr ppv);\n\n    [DllImport(\"ole32.dll\")]\n    private static extern int PropVariantClear(ref IntPtr pvar);\n\n    /// <summary>Write appId onto the shortcut's AppUserModelID property (idempotent).</summary>\n    public static void SetAppUserModelId(string lnkPath, string appId)\n    {\n        Guid iid = IID_IPropertyStore;\n        IntPtr storePtr;\n        int hr = SHGetPropertyStoreFromParsingName(lnkPath, IntPtr.Zero, 2 /*GPS_READWRITE*/, ref iid, out storePtr);\n        if (hr != 0) throw new COMException(\"open: 0x\" + hr.ToString(\"X8\"));\n        object obj = Marshal.GetObjectForIUnknown(storePtr);\n        try\n        {\n            IPropertyStore store = (IPropertyStore)obj;\n            PropertyKey key = new PropertyKey { fmtid = PKEY_AppUserModel_ID, pid = 5 };\n            PropVariant write = new PropVariant { vt = 31, ptr = Marshal.StringToCoTaskMemUni(appId) };\n            try\n            {\n                hr = store.SetValue(ref key, ref write);\n                if (hr != 0) throw new COMException(\"SetValue: 0x\" + hr.ToString(\"X8\"));\n                hr = store.Commit();\n                if (hr != 0) throw new COMException(\"Commit: 0x\" + hr.ToString(\"X8\"));\n            }\n            finally { PropVariantClear(ref write.ptr); }\n        }\n        finally { Marshal.FinalReleaseComObject(obj); }\n    }\n}\n";
 
-/** 身份注册脚本（幂等）：占位程序 + 图标 + 快捷方式 + AUMID，并迁移旧快捷方式。 */
+/** Windows 自定义协议处理器：把 Toast 点击先交给本机 GUI；无法交接时再打开浏览器。 */
+const ACTIVATION_STUB_CS = String.raw`using System;
+using System.Diagnostics;
+using System.Net;
+using System.Text;
+
+internal sealed class TimedWebClient : WebClient
+{
+    protected override WebRequest GetWebRequest(Uri address)
+    {
+        WebRequest request = base.GetWebRequest(address);
+        request.Timeout = 4000;
+        return request;
+    }
+}
+
+internal static class Program
+{
+    private static string QueryValue(Uri uri, string name)
+    {
+        string query = uri == null ? "" : uri.Query;
+        if (String.IsNullOrEmpty(query)) return "";
+        foreach (string part in query.TrimStart('?').Split('&'))
+        {
+            int equals = part.IndexOf('=');
+            string rawKey = equals < 0 ? part : part.Substring(0, equals);
+            string key;
+            try { key = Uri.UnescapeDataString(rawKey); } catch { continue; }
+            if (!String.Equals(key, name, StringComparison.OrdinalIgnoreCase)) continue;
+            string rawValue = equals < 0 ? "" : part.Substring(equals + 1);
+            try { return Uri.UnescapeDataString(rawValue.Replace("+", " ")); } catch { return ""; }
+        }
+        return "";
+    }
+
+    private static bool IsLoopbackHttp(Uri uri)
+    {
+        if (uri == null || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)) return false;
+        if (!String.IsNullOrEmpty(uri.Query) || !String.IsNullOrEmpty(uri.Fragment)) return false;
+        string host = uri.Host;
+        return String.Equals(host, "127.0.0.1", StringComparison.OrdinalIgnoreCase)
+            || String.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase)
+            || String.Equals(host, "::1", StringComparison.OrdinalIgnoreCase)
+            || String.Equals(host, "[::1]", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void OpenBrowser(string url)
+    {
+        try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); } catch { }
+    }
+
+    public static void Main(string[] args)
+    {
+        if (args == null || args.Length == 0) return;
+        Uri activation;
+        if (!Uri.TryCreate(args[0], UriKind.Absolute, out activation)
+            || !String.Equals(activation.Scheme, "dsh-win-notify", StringComparison.OrdinalIgnoreCase)) return;
+        string baseText = QueryValue(activation, "base");
+        string sessionId = QueryValue(activation, "session");
+        string token = QueryValue(activation, "token");
+        Uri baseUri;
+        if (String.IsNullOrEmpty(sessionId) || String.IsNullOrEmpty(token)
+            || !Uri.TryCreate(baseText, UriKind.Absolute, out baseUri) || !IsLoopbackHttp(baseUri)) return;
+        string baseUrl = baseText.TrimEnd('/');
+        string browserUrl = baseUrl + "/?session=" + Uri.EscapeDataString(sessionId);
+        bool handled = false;
+        try
+        {
+            string endpoint = baseUrl + "/dsh-win-notify/activate?session=" + Uri.EscapeDataString(sessionId)
+                + "&token=" + Uri.EscapeDataString(token);
+            using (TimedWebClient client = new TimedWebClient())
+            {
+                client.Proxy = null;
+                client.Encoding = Encoding.UTF8;
+                string response = client.UploadString(endpoint, "POST", "");
+                handled = response.IndexOf("\"handled\":true", StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+        }
+        catch { }
+        if (!handled) OpenBrowser(browserUrl);
+    }
+}`;
+
+/** 身份和本地协议注册脚本（幂等）：无控制台的处理器 + 图标 + 快捷方式 + AUMID。 */
 function registrationScript() {
   return [
     "$ErrorActionPreference = 'Stop'",
     "$appDir = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) '" + APP_DIR_NAME + "'",
     "New-Item -ItemType Directory -Force -Path $appDir | Out-Null",
     "$exe = Join-Path $appDir '" + STUB_EXE + "'",
-    "if (-not (Test-Path $exe)) {",
+    "$schemeReady = $false",
+    "try {",
+    "$versionFile = Join-Path $appDir '" + STUB_EXE + ".version'",
+    "$needsStub = -not (Test-Path $exe) -or -not (Test-Path $versionFile) -or ((Get-Content -LiteralPath $versionFile -Raw).Trim() -ne '" + STUB_VERSION + "')",
+    "if ($needsStub) {",
+    "  $tmp = Join-Path $appDir 'DeepSeek.next.exe'",
+    "  if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp -Force }",
     "  Add-Type -TypeDefinition @'",
-    "using System;",
-    "class Program { static void Main() { } }",
-    "'@ -OutputAssembly $exe -OutputType ConsoleApplication",
+    ACTIVATION_STUB_CS,
+    "'@ -OutputAssembly $tmp -OutputType WindowsApplication",
+    "  $replaced = $false",
+    "  $replaceAttempts = 0",
+    "  do {",
+    "    try {",
+    "      Copy-Item -LiteralPath $tmp -Destination $exe -Force",
+    "      $replaced = $true",
+    "    } catch {",
+    "      $replaceAttempts++",
+    "      if ($replaceAttempts -ge 5) { throw }",
+    "      Start-Sleep -Milliseconds 300",
+    "    }",
+    "  } while (-not $replaced)",
+    "  Remove-Item -LiteralPath $tmp -Force",
+    "  Set-Content -LiteralPath $versionFile -Value '" + STUB_VERSION + "' -NoNewline",
     "}",
     "Copy-Item '" + ICON_SOURCE + "' (Join-Path $appDir '" + ICON_FILE + "') -Force",
+    "$protocolKey = 'HKCU:\\Software\\Classes\\" + ACTIVATION_SCHEME + "'",
+    "New-Item -Path $protocolKey -Force | Out-Null",
+    "Set-Item -Path $protocolKey -Value 'URL:DeepSeek Harness notification activation'",
+    "New-ItemProperty -Path $protocolKey -Name 'URL Protocol' -PropertyType String -Value '' -Force | Out-Null",
+    "$protocolIconKey = Join-Path $protocolKey 'DefaultIcon'",
+    "New-Item -Path $protocolIconKey -Force | Out-Null",
+    "Set-Item -Path $protocolIconKey -Value ((Join-Path $appDir '" + ICON_FILE + "') + ',0')",
+    "$protocolCommandKey = Join-Path $protocolKey 'shell\\open\\command'",
+    "New-Item -Path $protocolCommandKey -Force | Out-Null",
+    "Set-Item -Path $protocolCommandKey -Value ('\"' + $exe + '\" \"%1\"')",
+    "$schemeReady = $true",
+    "} catch {",
+    "  Write-Output 'scheme=0'",
+    "}",
     "$startMenu = [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)",
     "$lnkPath = Join-Path $startMenu '" + SHORTCUT_NAME + "'",
     "$shell = New-Object -ComObject WScript.Shell",
@@ -164,7 +288,7 @@ function registrationScript() {
     "} while (-not $done)",
     "$old = Join-Path $startMenu '" + OLD_SHORTCUT_NAME + "'",
     "if (Test-Path $old) { Remove-Item $old -Force }",
-    "Write-Output 'registered'",
+    "Write-Output ('registered scheme=' + $(if ($schemeReady) { '1' } else { '0' }))",
   ].join("\n");
 }
 
@@ -174,7 +298,7 @@ function runPowerShell(ctx, executable, script, onDone, label) {
   let child;
   try {
     child = spawn(executable, ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
-      stdio: ["ignore", "ignore", "pipe"],
+      stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
   } catch (error) {
@@ -183,23 +307,25 @@ function runPowerShell(ctx, executable, script, onDone, label) {
     onDone?.(false, "");
     return;
   }
+  let stdout = "";
   let stderr = "";
+  child.stdout.on("data", (d) => { stdout += d.toString("utf8"); });
   child.stderr.on("data", (d) => { stderr += d.toString("utf8"); });
   let failed = false;
   child.on("error", (error) => {
     failed = true;
     log(`process error ${label}: ${error.message}`);
     ctx.logger.warn(`dsh-win-notify: 通知进程错误: ${error.message}`);
-    onDone?.(false, stderr);
+    onDone?.(false, stderr, stdout);
   });
   child.on("exit", (code) => {
     log(`exit ${label}: code=${code} stderr=${stderr.slice(0, 600).replace(/\\s+/g, " ")}`);
     if (code !== 0 && !failed) {
       ctx.logger.warn(`dsh-win-notify: 通知进程退出码 ${code}`);
-      onDone?.(false, stderr);
+      onDone?.(false, stderr, stdout);
       return;
     }
-    onDone?.(code === 0, stderr);
+    onDone?.(code === 0, stderr, stdout);
   });
 }
 
@@ -229,6 +355,16 @@ function lastTurnEndReason(agent) {
     }
   } catch { /* 投影失败按完成处理 */ }
   return undefined;
+}
+
+/** DSH 只为子代理持久化 header.origin = "subagent"；普通 fork 不会带该标记。 */
+function isSubagent(subject) {
+  try {
+    const session = subject?.session ?? subject;
+    return session?.header?.origin === "subagent";
+  } catch {
+    return false;
+  }
 }
 
 /** 该会话最近一条「用户本人」消息的文本（跳过系统注入的 runtime context / system-reminder）。 */
@@ -333,29 +469,30 @@ const REGISTER_RETRY_MIN_MS = 10000;
 function ensureRegistered(ctx) {
   if (registrationReady !== null) return registrationReady;
   if (!existsSync(PS5)) {
-    registrationReady = Promise.resolve(false);
+    registrationReady = Promise.resolve({ toast: false, scheme: false });
     return registrationReady;
   }
   // 上次失败后 10 秒内不重试，避免反复 spawn
-  if (Date.now() - lastAttemptAt < REGISTER_RETRY_MIN_MS) return Promise.resolve(false);
+  if (Date.now() - lastAttemptAt < REGISTER_RETRY_MIN_MS) return Promise.resolve({ toast: false, scheme: false });
   lastAttemptAt = Date.now();
   log("registration attempt start");
   registrationReady = new Promise((resolve) => {
-    runPowerShell(ctx, PS5, registrationScript(), (ok, stderr) => {
-      log(`registration attempt done: ok=${ok}`);
+    runPowerShell(ctx, PS5, registrationScript(), (ok, stderr, stdout) => {
+      const scheme = ok && /(?:^|\s)scheme=1(?:\s|$)/.test(stdout ?? "");
+      log(`registration attempt done: toast=${ok} scheme=${scheme}`);
       if (ok) {
-        ctx.logger.info(`dsh-win-notify: 通知身份 ${APP_ID} 已注册（${SHORTCUT_NAME}）`);
+        ctx.logger.info(`dsh-win-notify: 通知身份 ${APP_ID} 已注册（${SHORTCUT_NAME}，direct=${scheme}）`);
       } else {
         ctx.logger.warn("dsh-win-notify: 通知身份注册失败，将回退到气泡通知，稍后会重试");
         registrationReady = null; // 下次调用重试
       }
-      resolve(ok);
+      resolve({ toast: ok, scheme });
     }, "register");
   });
   return registrationReady;
 }
 
-function showToast(ctx, cfg, title, body, launch, sessionId) {
+function showToast(ctx, cfg, title, body, launchFactory, sessionId) {
   if (suppressFor(sessionId, cfg)) {
     log(`toast suppressed (session in foreground): ${title} | ${body}`);
     return;
@@ -364,9 +501,13 @@ function showToast(ctx, cfg, title, body, launch, sessionId) {
     ctx.logger.warn("dsh-win-notify: 找不到 powershell.exe，无法发送系统通知");
     return;
   }
-  const useToast = (registered) => {
-    if (registered) {
-      log(`toast shown via registered identity: ${title} | ${body} | launch=${launch ?? ""}`);
+  const useToast = (registration) => {
+    if (registration.toast) {
+      const launch = typeof launchFactory === "function" ? launchFactory(registration.scheme) : launchFactory;
+      const launchLog = typeof launch === "string" && launch.startsWith(ACTIVATION_SCHEME + ":")
+        ? ACTIVATION_SCHEME + "://…"
+        : launch ?? "";
+      log(`toast shown via registered identity: ${title} | ${body} | launch=${launchLog}`);
       runPowerShell(ctx, PS5, toastScript(title, body, cfg.sound, launch), undefined, "toast");
     } else if (process.platform === "win32") {
       log(`toast shown via balloon fallback: ${title} | ${body}`);
@@ -374,8 +515,8 @@ function showToast(ctx, cfg, title, body, launch, sessionId) {
     }
   };
   // 注册通常 ~2 秒完成；超时则直接走气泡回退，避免阻塞任务完成通知。
-  const timeout = new Promise((resolve) => setTimeout(() => resolve(false), 15000));
-  Promise.race([ensureRegistered(ctx), timeout]).then(useToast, () => useToast(false));
+  const timeout = new Promise((resolve) => setTimeout(() => resolve({ toast: false, scheme: false }), 15000));
+  Promise.race([ensureRegistered(ctx), timeout]).then(useToast, () => useToast({ toast: false, scheme: false }));
 }
 
 export function apply(ctx, config = {}) {
@@ -385,21 +526,113 @@ export function apply(ctx, config = {}) {
   /** agent -> 开始运行的时间戳；仅在 running→idle 且确实运行过时通知。 */
   const runningSince = new Map();
 
-  /** 点击跳转地址：GUI 根地址 + ?session=<会话ID>。subject 为 agent 或 session。 */
-  const launchFor = (subject) => {
+  /** GUI 根地址与传统 HTTP 深链；原生处理器交接失败时仍由它兜底。 */
+  const guiBase = () => {
+    const server = ctx.get("webServer");
+    const base = cfg.baseUrl ? cfg.baseUrl : `http://127.0.0.1:${server?.port ?? 3080}`;
+    return base.replace(/\/$/, "");
+  };
+  const isLoopbackBase = (base) => {
+    try {
+      const url = new URL(base);
+      return (url.protocol === "http:" || url.protocol === "https:")
+        && (url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "[::1]" || url.hostname === "::1")
+        && url.search === "" && url.hash === "";
+    } catch {
+      return false;
+    }
+  };
+  const browserLaunchFor = (sessionId, base = guiBase()) => `${base}/?session=${encodeURIComponent(sessionId)}`;
+  /** 点击跳转：本机协议优先交给已有 GUI；非环回自定义地址仍保持浏览器深链。 */
+  const launchFor = (subject, useDirect = true) => {
     if (!cfg.openOnClick) return void 0;
     const session = subject?.session ?? subject;
     const sessionId = session?.id;
     if (typeof sessionId !== "string" || sessionId === "") return void 0;
-    const server = ctx.get("webServer");
-    const base = cfg.baseUrl ? cfg.baseUrl : `http://127.0.0.1:${server?.port ?? 3080}`;
-    return `${base.replace(/\/$/, "")}/?session=${encodeURIComponent(sessionId)}`;
+    const base = guiBase();
+    const browser = browserLaunchFor(sessionId, base);
+    if (!useDirect || !cfg.directActivate || !isLoopbackBase(base)) return browser;
+    return `${ACTIVATION_SCHEME}://activate?base=${encodeURIComponent(base)}&session=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(ACTIVATION_TOKEN)}`;
+  };
+
+  /** 原生协议 → 已有浏览器标签页的单次命令队列。 */
+  const queuedCommands = new Map(); // clientId -> { id, sessionId, at }
+  const commandPolls = new Map(); // clientId -> { res, timer }
+  const activationAcks = new Map(); // commandId -> { clientId, resolve, timer }
+  const COMMAND_POLL_WAIT_MS = 25000;
+  const ACTIVATION_ACK_WAIT_MS = 2800;
+  const writeJson = (res, status, value) => {
+    if (res.destroyed || res.writableEnded) return;
+    const body = JSON.stringify(value);
+    res.writeHead(status, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Length": Buffer.byteLength(body),
+    });
+    res.end(body);
+  };
+  const settleActivation = (commandId, handled) => {
+    const entry = activationAcks.get(commandId);
+    if (entry === void 0) return false;
+    activationAcks.delete(commandId);
+    clearTimeout(entry.timer);
+    entry.resolve(handled);
+    return true;
+  };
+  const finishPoll = (clientId, entry, value) => {
+    if (commandPolls.get(clientId) !== entry) return;
+    commandPolls.delete(clientId);
+    clearTimeout(entry.timer);
+    writeJson(entry.res, 200, value);
+  };
+  const flushCommand = (clientId) => {
+    const command = queuedCommands.get(clientId);
+    const poll = commandPolls.get(clientId);
+    if (command === void 0 || poll === void 0) return false;
+    if (poll.res.destroyed || poll.res.writableEnded) {
+      commandPolls.delete(clientId);
+      clearTimeout(poll.timer);
+      return false;
+    }
+    queuedCommands.delete(clientId);
+    finishPoll(clientId, poll, { command: { id: command.id, sessionId: command.sessionId } });
+    return true;
+  };
+  const chooseLiveClient = () => {
+    const now = Date.now();
+    const ttl = Math.max(5000, Number(cfg.visibilityTtlMs) || 25000);
+    const candidates = [];
+    for (const [clientId, view] of clientViews) {
+      if (view === void 0 || now - Number(view.at) > ttl) {
+        clientViews.delete(clientId);
+        continue;
+      }
+      candidates.push({ clientId, view });
+    }
+    candidates.sort((a, b) => Number(Boolean(b.view.focused)) - Number(Boolean(a.view.focused)) || Number(b.view.at) - Number(a.view.at));
+    return candidates[0];
+  };
+  const enqueueActivation = (clientId, sessionId) => {
+    for (const [id, entry] of activationAcks) if (entry.clientId === clientId) settleActivation(id, false);
+    const previous = queuedCommands.get(clientId);
+    if (previous !== void 0) queuedCommands.delete(clientId);
+    const command = { id: randomBytes(12).toString("hex"), sessionId, at: Date.now() };
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (queuedCommands.get(clientId)?.id === command.id) queuedCommands.delete(clientId);
+        settleActivation(command.id, false);
+      }, ACTIVATION_ACK_WAIT_MS);
+      activationAcks.set(command.id, { clientId, resolve, timer });
+      queuedCommands.set(clientId, command);
+      flushCommand(clientId);
+    });
   };
 
   const notify = (agent, body) => {
+    if (isSubagent(agent)) return;
     const prompt = truncate(lastUserPrompt(agent), cfg.maxPromptChars);
     const text = prompt ? `${body}：${prompt}` : body;
-    showToast(ctx, cfg, cfg.title, text, launchFor(agent), agent?.session?.id);
+    showToast(ctx, cfg, cfg.title, text, (useDirect) => launchFor(agent, useDirect), agent?.session?.id);
   };
 
   /** approvalId -> 防抖定时器；asked 后超过 approvalWaitMs 仍未 decided 才弹「等待审批」。 */
@@ -421,6 +654,7 @@ export function apply(ctx, config = {}) {
   const pendingQuestions = new Map();
 
   const disposeApprovalWatch = ctx.on("session/event", (session, event) => {
+    if (isSubagent(session)) return;
     try {
       if (event?.type === "approval/asked") {
         if (!cfg.approval) return;
@@ -432,7 +666,7 @@ export function apply(ctx, config = {}) {
           pendingApprovals.delete(id);
           if (isApprovalDecided(session?.events ?? [], id)) return; // 阈值内已被决定（或策略 never/无应答方），不打扰
           const body = approvalNoticeBody(event, cfg);
-          if (body) showToast(ctx, cfg, cfg.title, body, launchFor(session), session?.id);
+          if (body) showToast(ctx, cfg, cfg.title, body, (useDirect) => launchFor(session, useDirect), session?.id);
         }, waitMs);
         pendingApprovals.set(id, timer);
       } else if (event?.type === "approval/decided") {
@@ -457,7 +691,7 @@ export function apply(ctx, config = {}) {
         const waitMs = Math.max(0, Number(cfg.questionWaitMs) || 0);
         const timer = setTimeout(() => {
           pendingQuestions.delete(key);
-          showToast(ctx, cfg, cfg.title, `${cfg.bodyQuestion}：${truncate(text, Math.max(1, Number(cfg.maxQuestionChars) || 80))}`, launchFor(session), session?.id);
+          showToast(ctx, cfg, cfg.title, `${cfg.bodyQuestion}：${truncate(text, Math.max(1, Number(cfg.maxQuestionChars) || 80))}`, (useDirect) => launchFor(session, useDirect), session?.id);
         }, waitMs);
         pendingQuestions.set(key, { timer, rootId });
       } else if (event?.type === "tool/result") {
@@ -484,6 +718,7 @@ export function apply(ctx, config = {}) {
   });
 
   ctx.on("agent/status", ({ status, agent }) => {
+    if (isSubagent(agent)) return;
     if (status === "running") {
       runningSince.set(agent, Date.now());
       return;
@@ -504,41 +739,145 @@ export function apply(ctx, config = {}) {
     notify(agent, cfg.body);
   });
 
-  // 浏览器前台状态上报路由（页面聚焦 + 当前选中会话）——抑制前台会话的通知
-  // 注意：本行无 inject，apply 时 webServer 服务可能尚未挂载——监听 internal/service 等待它出现再注册。
-  let focusRouteRegistered = false;
-  const registerFocusRoute = () => {
-    if (focusRouteRegistered || !cfg.suppressWhenVisible) return;
-    const webServer = ctx.get("webServer");
-    if (webServer === undefined) return;
-    focusRouteRegistered = true;
-    ctx.effect(() => webServer.register({
-      kind: "exact",
-      path: "/dsh-win-notify/focus",
-      handler: (req, res) => {
-        try {
-          const url = new URL(req.url ?? "/", "http://localhost");
-          const focused = url.searchParams.get("focused") === "1";
-          const sessionId = url.searchParams.get("session") ?? "";
-          const clientId = url.searchParams.get("client") ?? "unknown";
-          const previous = clientViews.get(clientId);
-          const changed = previous === void 0 || previous.focused !== focused || previous.sessionId !== sessionId;
-          clientViews.set(clientId, { focused, sessionId, at: Date.now() });
-          if (changed) log("client view: client=" + clientId.slice(0, 8) + " focused=" + focused + " session=" + (sessionId || "(none)"));
-          res.writeHead(204);
-        } catch {
-          res.writeHead(400);
-        }
-        res.end();
-      }
-    }), "dsh-win-notify: focus report route");
+  // 浏览器前台状态、命令长轮询与原生协议激活路由。
+  // 不依赖 suppressWhenVisible：即使关闭通知抑制，也要能将 Toast 点击交给已有 GUI。
+  const validId = (value) => typeof value === "string" && value !== "" && value.length <= 512;
+  const isLoopbackRequest = (req) => {
+    const address = String(req.socket?.remoteAddress ?? "");
+    return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
   };
-  if (cfg.suppressWhenVisible) {
-    ctx.on("internal/service", registerFocusRoute);
-    registerFocusRoute();
-    const focusRetry = setTimeout(registerFocusRoute, 3000);
-    ctx.on("dispose", () => clearTimeout(focusRetry));
-  }
+  let clientRoutesRegistered = false;
+  const registerClientRoutes = () => {
+    if (clientRoutesRegistered) return;
+    const webServer = ctx.get("webServer");
+    if (webServer === void 0) return;
+    clientRoutesRegistered = true;
+    ctx.effect(() => {
+      const unregisterFocus = webServer.register({
+        kind: "exact",
+        path: "/dsh-win-notify/focus",
+        handler: (req, res) => {
+          try {
+            if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
+            const url = new URL(req.url ?? "/", "http://localhost");
+            const focused = url.searchParams.get("focused") === "1";
+            const sessionId = url.searchParams.get("session") ?? "";
+            const clientId = url.searchParams.get("client") ?? "";
+            if (!validId(clientId) || sessionId.length > 512) { res.writeHead(400); res.end(); return; }
+            const previous = clientViews.get(clientId);
+            const changed = previous === void 0 || previous.focused !== focused || previous.sessionId !== sessionId;
+            clientViews.set(clientId, { focused, sessionId, at: Date.now() });
+            if (changed) log("client view: client=" + clientId.slice(0, 8) + " focused=" + focused + " session=" + (sessionId || "(none)"));
+            res.writeHead(204);
+          } catch {
+            res.writeHead(400);
+          }
+          res.end();
+        },
+      });
+      const unregisterCommands = webServer.register({
+        kind: "exact",
+        path: "/dsh-win-notify/commands",
+        handler: (req, res) => {
+          try {
+            if (req.method !== "GET") { writeJson(res, 405, { command: null }); return; }
+            const url = new URL(req.url ?? "/", "http://localhost");
+            const clientId = url.searchParams.get("client") ?? "";
+            if (!validId(clientId)) { writeJson(res, 400, { command: null }); return; }
+            const queued = queuedCommands.get(clientId);
+            if (queued !== void 0) {
+              queuedCommands.delete(clientId);
+              writeJson(res, 200, { command: { id: queued.id, sessionId: queued.sessionId } });
+              return;
+            }
+            const previous = commandPolls.get(clientId);
+            if (previous !== void 0) finishPoll(clientId, previous, { command: null });
+            const entry = { res, timer: void 0 };
+            entry.timer = setTimeout(() => finishPoll(clientId, entry, { command: null }), COMMAND_POLL_WAIT_MS);
+            commandPolls.set(clientId, entry);
+            req.once("close", () => {
+              if (commandPolls.get(clientId) !== entry) return;
+              commandPolls.delete(clientId);
+              clearTimeout(entry.timer);
+            });
+          } catch {
+            writeJson(res, 400, { command: null });
+          }
+        },
+      });
+      const unregisterAck = webServer.register({
+        kind: "exact",
+        path: "/dsh-win-notify/ack",
+        handler: (req, res) => {
+          try {
+            if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
+            const url = new URL(req.url ?? "/", "http://localhost");
+            const clientId = url.searchParams.get("client") ?? "";
+            const commandId = url.searchParams.get("command") ?? "";
+            const entry = activationAcks.get(commandId);
+            if (!validId(clientId) || !validId(commandId) || entry === void 0 || entry.clientId !== clientId) { res.writeHead(404); res.end(); return; }
+            if (queuedCommands.get(clientId)?.id === commandId) queuedCommands.delete(clientId);
+            const ok = url.searchParams.get("ok") === "1";
+            settleActivation(commandId, ok);
+            log("direct activation ack: client=" + clientId.slice(0, 8) + " ok=" + ok);
+            res.writeHead(204);
+          } catch {
+            res.writeHead(400);
+          }
+          res.end();
+        },
+      });
+      const unregisterActivation = webServer.register({
+        kind: "exact",
+        path: "/dsh-win-notify/activate",
+        handler: async (req, res) => {
+          try {
+            if (req.method !== "POST") { writeJson(res, 405, { handled: false }); return; }
+            const url = new URL(req.url ?? "/", "http://localhost");
+            const sessionId = url.searchParams.get("session") ?? "";
+            if (!isLoopbackRequest(req) || !cfg.openOnClick || !cfg.directActivate || url.searchParams.get("token") !== ACTIVATION_TOKEN || !validId(sessionId)) {
+              writeJson(res, 403, { handled: false });
+              return;
+            }
+            const target = chooseLiveClient();
+            if (target === void 0) {
+              log("direct activation fallback: no live GUI for session=" + sessionId);
+              writeJson(res, 200, { handled: false });
+              return;
+            }
+            if (target.view.focused === true && target.view.sessionId === sessionId) {
+              writeJson(res, 200, { handled: true });
+              return;
+            }
+            log("direct activation queued: client=" + target.clientId.slice(0, 8) + " session=" + sessionId);
+            const handled = await enqueueActivation(target.clientId, sessionId);
+            writeJson(res, 200, { handled });
+          } catch {
+            writeJson(res, 500, { handled: false });
+          }
+        },
+      });
+      return () => {
+        unregisterFocus();
+        unregisterCommands();
+        unregisterAck();
+        unregisterActivation();
+      };
+    }, "dsh-win-notify: client activation routes");
+  };
+  ctx.on("internal/service", registerClientRoutes);
+  registerClientRoutes();
+  const routeRetry = setTimeout(registerClientRoutes, 3000);
+  ctx.on("dispose", () => {
+    clearTimeout(routeRetry);
+    for (const entry of commandPolls.values()) {
+      clearTimeout(entry.timer);
+      try { entry.res.end(); } catch { /* 忽略 */ }
+    }
+    commandPolls.clear();
+    queuedCommands.clear();
+    for (const commandId of [...activationAcks.keys()]) settleActivation(commandId, false);
+  });
 
   log(`apply: enabled, sound=${cfg.sound}, approval=${cfg.approval}, approvalWaitMs=${cfg.approvalWaitMs}`);
   void ensureRegistered(ctx); // 激活即注册，不阻塞

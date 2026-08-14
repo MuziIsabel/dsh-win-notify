@@ -12,6 +12,8 @@
 #   body           completion text (default "任务已完成")
 #   bodyError      error text (default "任务出错")
 #   maxPromptChars max length of the user prompt shown in the body (default 64)
+#   openOnClick    let notification clicks open the relevant GUI session (default true)
+#   directActivate send loopback clicks to an existing GUI tab before opening a browser (default true)
 #   approval       notify when waiting for user approval (default true)
 #   approvalWaitMs notify only if still undecided after this delay in ms (default 3000)
 #   bodyApproval   approval-waiting text (default "等待用户审批")

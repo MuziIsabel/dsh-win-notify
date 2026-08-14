@@ -174,6 +174,82 @@ window.__ModuleLoader__.load({
 			return stop;
 		}
 
+		/** 本地协议点击通过宿主长轮询下发命令，直接在当前标签切换会话而不新开浏览器页。 */
+		function setupDirectActivationPolling(ctx, clientId) {
+			const origin = window.location.origin;
+			ctx.effect(() => {
+				let stopped = false;
+				let controller;
+				let retryTimer;
+				let opening;
+				const acknowledge = (commandId, ok) => {
+					const url = origin + "/dsh-win-notify/ack?client=" + encodeURIComponent(clientId)
+						+ "&command=" + encodeURIComponent(commandId) + "&ok=" + (ok ? "1" : "0");
+					fetch(url, { method: "POST", keepalive: true, cache: "no-store" }).catch(() => {});
+				};
+				const stopOpening = (ok) => {
+					if (opening === void 0) return;
+					const current = opening;
+					opening = void 0;
+					clearTimeout(current.timer);
+					current.stop();
+					acknowledge(current.id, ok);
+				};
+				const accept = (command) => {
+					if (command === null || typeof command !== "object" || typeof command.id !== "string" || command.id === "" || typeof command.sessionId !== "string" || command.sessionId === "") return;
+					stopOpening(false);
+					let settled = false;
+					let timer;
+					const finish = (ok) => {
+						if (settled) return;
+						settled = true;
+						if (timer !== void 0) clearTimeout(timer);
+						if (opening?.id === command.id) opening = void 0;
+						acknowledge(command.id, ok);
+						if (ok) try { window.focus(); } catch { /* 浏览器可能拒绝非用户手势聚焦 */ }
+					};
+					const stop = openSessionWhenReady(ctx, command.sessionId, () => finish(true));
+					if (!settled) {
+						timer = setTimeout(() => {
+							stop();
+							finish(false);
+						}, 8000);
+						opening = { id: command.id, stop, timer };
+					}
+				};
+				const poll = async () => {
+					if (stopped) return;
+					const currentController = new AbortController();
+					controller = currentController;
+					let retryDelay = 100;
+					try {
+						const response = await fetch(origin + "/dsh-win-notify/commands?client=" + encodeURIComponent(clientId), {
+							cache: "no-store",
+							signal: currentController.signal,
+						});
+						if (!response.ok) {
+							retryDelay = 1000;
+							return;
+						}
+						const payload = await response.json();
+						accept(payload?.command);
+					} catch {
+						retryDelay = 1000;
+					} finally {
+						if (controller === currentController) controller = void 0;
+						if (!stopped) retryTimer = setTimeout(poll, retryDelay);
+					}
+				};
+				poll();
+				return () => {
+					stopped = true;
+					if (controller !== void 0) controller.abort();
+					if (retryTimer !== void 0) clearTimeout(retryTimer);
+					stopOpening(false);
+				};
+			}, "dsh-win-notify: direct activation polling");
+		}
+
 		/** 为每个已打开的 GUI 标签监听来自新通知标签的会话交接请求。 */
 		function setupTabHandoff(ctx, tabId) {
 			if (typeof BroadcastChannel !== "function") return;
@@ -337,6 +413,7 @@ window.__ModuleLoader__.load({
 			const tabId = newTabId();
 			// 前台状态上报和跨标签页交接始终启用。
 			setupFocusReporting(ctx, tabId);
+			setupDirectActivationPolling(ctx, tabId);
 			setupTabHandoff(ctx, tabId);
 			const sessionId = targetSessionId();
 			if (sessionId !== void 0) handoffOrOpenHere(ctx, sessionId, tabId);

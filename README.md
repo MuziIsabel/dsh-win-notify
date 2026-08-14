@@ -3,10 +3,10 @@
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plugin that shows a **Windows toast notification with sound** when an agent task finishes.
 
 - App name **DeepSeek** with the official whale icon in the notification
-- Notifies when an agent turn completes (running → idle)
+- Notifies when a **top-level** agent turn completes (running → idle); subagent turns stay silent
 - Shows the last user prompt in the notification body
 - Also notifies on task errors (configurable)
-- **Click the notification to reuse an existing GUI tab and jump straight to that session**; when no matching tab exists, it opens a new one (deep link via `?session=<id>`)
+- **Click the notification to switch a live GUI tab in place** — no transient browser tab; only when no live GUI exists does it open a new one (deep link via `?session=<id>`)
 - Also notifies while waiting for user approval on sandbox/permission requests (configurable)
 - Also notifies when the agent asks you a question (`ask_user_question`) and waits for your reply (configurable)
 - **Focus-aware:** while the GUI page is focused and showing the session that triggered the event, that session's notifications are suppressed — no disturbance when you are already watching
@@ -48,7 +48,8 @@ config in the profile's `cordis.patch.yml`:
     enabled: true          # enable the plugin (default true)
     sound: default         # default | reminder | sms | alarm | silent
     onError: true          # also notify on task errors (default true)
-    openOnClick: true      # click to open the GUI at that session (default true)
+    openOnClick: true      # click to open/select the GUI session (default true)
+    directActivate: true   # deliver to a live loopback GUI tab first; otherwise use browser deep-link
     baseUrl: ''            # custom GUI root URL (default: auto from webServer port)
     approval: true         # notify while waiting for user approval (default true)
     approvalWaitMs: 3000   # how long an approval may pend before notifying
@@ -83,14 +84,17 @@ config in the profile's `cordis.patch.yml`:
    `ToastNotification` with an `ms-winsoundevent` audio element, so Chinese
    text is never garbled. If registration fails, it falls back to a
    `NotifyIcon` balloon.
-4. **Click-to-open with tab reuse.** The toast carries `activationType="protocol"`
-   with a `launch` URL (`<gui>/?session=<id>`). The client plugin
-   (`client.js`, declared via `dsh.client`) uses a same-origin
-   `BroadcastChannel` to hand the target session to the most recently focused,
-   connected GUI tab. It then closes the transient tab when the browser allows;
-   with no live same-origin tab (or where the browser blocks closing it), the new
-   tab opens the session directly. The `session` parameter is stripped after a
-   successful local open so refreshes do not repeat it.
+4. **Click-to-open without a transient tab.** On loopback GUI URLs, the
+   registered `dsh-win-notify://` protocol starts the small local
+   `DeepSeek.exe` helper rather than a browser. It asks the local DSH server
+   to deliver an `open-session` command to the most recently focused live GUI
+   tab; that tab calls `sessions.open(id)` in place (no full-page refresh and
+   no new browser tab). If no live GUI acknowledges promptly, or the protocol
+   registration is unavailable, the helper safely falls back to the normal
+   `<gui>/?session=<id>` deep link; its `BroadcastChannel` handoff remains a
+   second fallback. The first custom-protocol click can require a one-time
+   browser/Windows confirmation. Non-loopback custom `baseUrl` values keep the
+   normal HTTP deep link for safety.
 
 ## Troubleshooting
 
