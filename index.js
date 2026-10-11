@@ -15,11 +15,12 @@
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, appendFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { appendFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import z from "@deepseek-ai/schemastery";
+import { resolveWindowsHost } from "./windows-host.js";
 
 export const name = "dsh-win-notify";
 
@@ -85,7 +86,7 @@ const SHORTCUT_NAME = "DeepSeek.lnk";
 const OLD_SHORTCUT_NAME = "dsh-win-notify.lnk";
 const APP_DIR_NAME = "DeepSeek"; // %LOCALAPPDATA%\DeepSeek
 const STUB_EXE = "DeepSeek.exe";
-const STUB_VERSION = "6";
+const STUB_VERSION = "12";
 const ACTIVATION_SCHEME = "dsh-win-notify";
 const ICON_FILE = "DeepSeek.ico";
 /** 每个宿主进程的激活密钥；仅 Toast 的本地协议处理器持有。 */
@@ -124,10 +125,8 @@ const SOUNDS = {
 };
 
 /** Windows PowerShell 5.1（带 WinRT 投影，能弹 Toast）。 */
-const PS5 = join(
-  process.env.SystemRoot ?? "C:\\Windows",
-  "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
-);
+const WINDOWS_HOST = resolveWindowsHost();
+const PS5 = WINDOWS_HOST?.powershell;
 
 /** C# 帮助类：给 .lnk 快捷方式写 AppUserModelID（IPropertyStore P/Invoke）。 */
 const PROPSTORE_CS = "using System;\nusing System.Runtime.InteropServices;\n\npublic static class PropStore\n{\n    private static readonly Guid IID_IPropertyStore = new Guid(\"886d8eeb-8cf2-4446-8d02-cdba1dbdcf99\");\n    private static readonly Guid PKEY_AppUserModel_ID = new Guid(\"9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3\");\n\n    [StructLayout(LayoutKind.Sequential)]\n    private struct PropertyKey { public Guid fmtid; public uint pid; }\n\n    [ComImport, Guid(\"886d8eeb-8cf2-4446-8d02-cdba1dbdcf99\"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]\n    private interface IPropertyStore\n    {\n        int GetCount(out uint cProps);\n        int GetAt(uint iProp, out PropertyKey pkey);\n        int GetValue(ref PropertyKey key, out IntPtr pv);\n        int SetValue(ref PropertyKey key, ref PropVariant pv);\n        int Commit();\n    }\n\n    [StructLayout(LayoutKind.Explicit)]\n    private struct PropVariant\n    {\n        [FieldOffset(0)] public ushort vt;\n        [FieldOffset(8)] public IntPtr ptr;\n    }\n\n    [DllImport(\"shell32.dll\", CharSet = CharSet.Unicode)]\n    private static extern int SHGetPropertyStoreFromParsingName(string pszPath, IntPtr pbc, uint flags, ref Guid riid, out IntPtr ppv);\n\n    [DllImport(\"ole32.dll\")]\n    private static extern int PropVariantClear(ref IntPtr pvar);\n\n    /// <summary>Write appId onto the shortcut's AppUserModelID property (idempotent).</summary>\n    public static void SetAppUserModelId(string lnkPath, string appId)\n    {\n        Guid iid = IID_IPropertyStore;\n        IntPtr storePtr;\n        int hr = SHGetPropertyStoreFromParsingName(lnkPath, IntPtr.Zero, 2 /*GPS_READWRITE*/, ref iid, out storePtr);\n        if (hr != 0) throw new COMException(\"open: 0x\" + hr.ToString(\"X8\"));\n        object obj = Marshal.GetObjectForIUnknown(storePtr);\n        try\n        {\n            IPropertyStore store = (IPropertyStore)obj;\n            PropertyKey key = new PropertyKey { fmtid = PKEY_AppUserModel_ID, pid = 5 };\n            PropVariant write = new PropVariant { vt = 31, ptr = Marshal.StringToCoTaskMemUni(appId) };\n            try\n            {\n                hr = store.SetValue(ref key, ref write);\n                if (hr != 0) throw new COMException(\"SetValue: 0x\" + hr.ToString(\"X8\"));\n                hr = store.Commit();\n                if (hr != 0) throw new COMException(\"Commit: 0x\" + hr.ToString(\"X8\"));\n            }\n            finally { PropVariantClear(ref write.ptr); }\n        }\n        finally { Marshal.FinalReleaseComObject(obj); }\n    }\n}\n";
@@ -220,13 +219,33 @@ internal static class Program
     [DllImport("user32.dll")]
     private static extern bool IsIconic(IntPtr hWnd);
 
-    private static bool IsChromiumWindow(AutomationElement window)
+    private delegate bool EnumWindowCallback(IntPtr window, IntPtr parameter);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowCallback callback, IntPtr parameter);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr window, StringBuilder text, int maximum);
+
+    private static bool IsSupportedBrowserProcessName(string name)
+    {
+        return String.Equals(name, "chrome", StringComparison.OrdinalIgnoreCase)
+            || String.Equals(name, "msedge", StringComparison.OrdinalIgnoreCase)
+            || String.Equals(name, "firefox", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSupportedBrowserWindow(AutomationElement window)
     {
         try
         {
             string name = Process.GetProcessById(window.Current.ProcessId).ProcessName;
-            return String.Equals(name, "chrome", StringComparison.OrdinalIgnoreCase)
-                || String.Equals(name, "msedge", StringComparison.OrdinalIgnoreCase);
+            return IsSupportedBrowserProcessName(name);
         }
         catch { return false; }
     }
@@ -235,7 +254,30 @@ internal static class Program
     {
         if (String.IsNullOrEmpty(actual) || String.IsNullOrEmpty(expected)) return false;
         return String.Equals(actual, expected, StringComparison.Ordinal)
-            || actual.StartsWith(expected + " - ", StringComparison.Ordinal);
+            || actual.StartsWith(expected + " - ", StringComparison.Ordinal)
+            || actual.StartsWith(expected + " — ", StringComparison.Ordinal);
+    }
+
+    private static IntPtr FindBrowserWindowByTitle(string title)
+    {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr window, IntPtr parameter)
+        {
+            try
+            {
+                if (!IsWindowVisible(window)) return true;
+                uint processId;
+                GetWindowThreadProcessId(window, out processId);
+                if (!IsSupportedBrowserProcessName(Process.GetProcessById((int)processId).ProcessName)) return true;
+                StringBuilder text = new StringBuilder(1024);
+                GetWindowText(window, text, text.Capacity);
+                if (!MatchesTabTitle(text.ToString(), title)) return true;
+                found = window;
+                return false;
+            }
+            catch { return true; }
+        }, IntPtr.Zero);
+        return found;
     }
 
     // GUI tab titles always end with the app name; use it as a race-proof fallback marker.
@@ -243,16 +285,16 @@ internal static class Program
 
     private static void BringBrowserWindowForward(AutomationElement window)
     {
-        try
-        {
-            int handle = window.Current.NativeWindowHandle;
-            if (handle == 0) return;
-            // SW_RESTORE un-maximizes a maximized window; only restore minimized ones.
-            IntPtr pointer = new IntPtr(handle);
-            if (IsIconic(pointer)) ShowWindow(pointer, 9); // SW_RESTORE
-            SetForegroundWindow(pointer);
-        }
+        try { BringNativeWindowForward(new IntPtr(window.Current.NativeWindowHandle)); }
         catch { }
+    }
+
+    private static void BringNativeWindowForward(IntPtr pointer)
+    {
+        if (pointer == IntPtr.Zero) return;
+        // SW_RESTORE un-maximizes a maximized window; only restore minimized ones.
+        if (IsIconic(pointer)) ShowWindow(pointer, 9); // SW_RESTORE
+        SetForegroundWindow(pointer);
     }
 
     private static bool SelectTabElement(AutomationElement tab)
@@ -287,18 +329,25 @@ internal static class Program
         return false;
     }
 
-    // Browser page-side focus is restricted; try the current Chromium window first.
+    // Browser page-side focus is restricted; try the current supported browser first.
     // Any failure leaves the already-switched session intact and preserves HTTP fallback.
     private static void ActivateBrowserTab(string title)
     {
         if (String.IsNullOrEmpty(title)) return;
         try
         {
+            // The selected tab's native window title works even with accessibility disabled.
+            IntPtr matching = FindBrowserWindowByTitle(title);
+            if (matching != IntPtr.Zero)
+            {
+                BringNativeWindowForward(matching);
+                return;
+            }
             IntPtr foreground = GetForegroundWindow();
             if (foreground != IntPtr.Zero)
             {
                 AutomationElement current = AutomationElement.FromHandle(foreground);
-                if (current != null && IsChromiumWindow(current))
+                if (current != null && IsSupportedBrowserWindow(current))
                 {
                     BringBrowserWindowForward(current);
                     if (SelectTabInWindow(current, title)) return;
@@ -311,7 +360,7 @@ internal static class Program
                     new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Window));
                 foreach (AutomationElement window in windows)
                 {
-                    if (!IsChromiumWindow(window)) continue;
+                    if (!IsSupportedBrowserWindow(window)) continue;
                     if (window.Current.NativeWindowHandle == foreground.ToInt32()) continue;
                     // Select a matching tab exposed by a background window's accessibility tree.
                     if (!SelectTabInWindow(window, title)) continue;
@@ -379,7 +428,7 @@ function registrationScript() {
     "  $tmp = Join-Path $appDir 'DeepSeek.next.exe'",
     "  if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp -Force }",
     "  $runtime = [Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()",
-    "  $automationRefs = @((Join-Path $runtime 'WPF\UIAutomationClient.dll'), (Join-Path $runtime 'WPF\UIAutomationTypes.dll'))",
+    "  $automationRefs = @((Join-Path $runtime 'WPF\\UIAutomationClient.dll'), (Join-Path $runtime 'WPF\\UIAutomationTypes.dll'))",
     "  Add-Type -TypeDefinition @'",
     ACTIVATION_STUB_CS,
     "'@ -OutputAssembly $tmp -OutputType WindowsApplication -ReferencedAssemblies $automationRefs",
@@ -398,7 +447,7 @@ function registrationScript() {
     "  Remove-Item -LiteralPath $tmp -Force",
     "  Set-Content -LiteralPath $versionFile -Value '" + STUB_VERSION + "' -NoNewline",
     "}",
-    "Copy-Item '" + ICON_SOURCE + "' (Join-Path $appDir '" + ICON_FILE + "') -Force",
+    "Copy-Item -LiteralPath '" + WINDOWS_HOST.toWindowsPath(ICON_SOURCE).replaceAll("'", "''") + "' (Join-Path $appDir '" + ICON_FILE + "') -Force",
     "$protocolKey = 'HKCU:\\Software\\Classes\\" + ACTIVATION_SCHEME + "'",
     "New-Item -Path $protocolKey -Force | Out-Null",
     "Set-Item -Path $protocolKey -Value 'URL:DeepSeek Harness notification activation'",
@@ -457,10 +506,11 @@ function runPowerShell(ctx, executable, script, onDone, label) {
       // of argv, preserving Unicode with a UTF-16LE BOM script file instead.
       scriptPath = join(tmpdir(), "dsh-win-notify-" + process.pid + "-" + randomBytes(8).toString("hex") + ".ps1");
       writeFileSync(scriptPath, "\ufeff" + script, "utf16le");
-      args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath];
+      args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", WINDOWS_HOST.toWindowsPath(scriptPath)];
       log("large PowerShell script staged: " + (label ?? "unnamed"));
     }
   } catch (error) {
+    if (scriptPath) { try { unlinkSync(scriptPath); } catch { /* best effort */ } }
     log("stage fail " + label + ": " + error.message);
     ctx.logger.warn("dsh-win-notify: 无法准备通知进程脚本: " + error.message);
     onDone?.(false, "");
@@ -619,7 +669,7 @@ function toastScript(title, body, sound, launch) {
   ].join("\n");
 }
 
-/** 回退方案：pwsh + NotifyIcon 气泡（带系统提示音）。 */
+/** 回退方案：Windows PowerShell 5.1 + NotifyIcon 气泡（带系统提示音）。 */
 function balloonScript(title, body) {
   const textTitle = escapeXml(title);
   const textBody = escapeXml(body);
@@ -646,7 +696,8 @@ const REGISTER_RETRY_MIN_MS = 10000;
 
 function ensureRegistered(ctx) {
   if (registrationReady !== null) return registrationReady;
-  if (!existsSync(PS5)) {
+  if (!PS5) {
+    log("registration unavailable: Windows PowerShell 5.1 not found (requires Windows or WSL interop PATH)");
     registrationReady = Promise.resolve({ toast: false, scheme: false });
     return registrationReady;
   }
@@ -655,17 +706,28 @@ function ensureRegistered(ctx) {
   lastAttemptAt = Date.now();
   log("registration attempt start");
   registrationReady = new Promise((resolve) => {
-    runPowerShell(ctx, PS5, registrationScript(), (ok, stderr, stdout) => {
+    let script;
+    try { script = registrationScript(); } catch (error) {
+      log("registration path conversion failed: " + error.message);
+      ctx.logger.warn("dsh-win-notify: " + error.message);
+      resolve({ toast: false, scheme: false });
+      return;
+    }
+    runPowerShell(ctx, PS5, script, (ok, stderr, stdout) => {
       const scheme = ok && /(?:^|\s)scheme=1(?:\s|$)/.test(stdout ?? "");
       log(`registration attempt done: toast=${ok} scheme=${scheme}`);
       if (ok) {
         ctx.logger.info(`dsh-win-notify: 通知身份 ${APP_ID} 已注册（${SHORTCUT_NAME}，direct=${scheme}）`);
       } else {
         ctx.logger.warn("dsh-win-notify: 通知身份注册失败，将回退到气泡通知，稍后会重试");
-        registrationReady = null; // 下次调用重试
       }
       resolve({ toast: ok, scheme });
     }, "register");
+  });
+  // Clear every failure after assignment, including synchronous preparation/spawn failures.
+  const attempt = registrationReady;
+  void attempt.then((result) => {
+    if (!result.toast && registrationReady === attempt) registrationReady = null;
   });
   return registrationReady;
 }
@@ -675,7 +737,7 @@ function showToast(ctx, cfg, title, body, launchFactory, sessionId) {
     log(`toast suppressed (session in foreground): ${title} | ${body}`);
     return;
   }
-  if (!existsSync(PS5)) {
+  if (!PS5) {
     ctx.logger.warn("dsh-win-notify: 找不到 powershell.exe，无法发送系统通知");
     return;
   }
@@ -687,9 +749,9 @@ function showToast(ctx, cfg, title, body, launchFactory, sessionId) {
         : launch ?? "";
       log(`toast shown via registered identity: ${title} | ${body} | launch=${launchLog}`);
       runPowerShell(ctx, PS5, toastScript(title, body, cfg.sound, launch), undefined, "toast");
-    } else if (process.platform === "win32") {
+    } else {
       log(`toast shown via balloon fallback: ${title} | ${body}`);
-      runPowerShell(ctx, "pwsh", balloonScript(title, body), undefined, "balloon");
+      runPowerShell(ctx, PS5, balloonScript(title, body), undefined, "balloon");
     }
   };
   // 注册通常 ~2 秒完成；超时则直接走气泡回退，避免阻塞任务完成通知。
