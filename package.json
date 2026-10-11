@@ -4,6 +4,9 @@
   "description": "DSH plugin: Windows toast notification with sound when an agent task completes.",
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test test/plugin.test.js test/windows-host.test.js"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -11,6 +14,7 @@
   },
   "files": [
     "index.js",
+    "windows-host.js",
     "client.js",
     "assets",
     "cordis.patch.yml"

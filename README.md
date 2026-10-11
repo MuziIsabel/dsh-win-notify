@@ -18,7 +18,23 @@
 ## 环境要求
 
 - Windows 10/11
+- 原生 Windows Node.js，或启用了 Windows 可执行文件互操作的 WSL2。
+  WSL 中的 `PATH` 必须包含 `powershell.exe`（Windows PowerShell 5.1），
+  且 `wslpath` 可用；无需 PowerShell 7（`pwsh`）。
 - dsh（DeepSeek Harness）—— 任意 profile（web、headless、tui）
+
+### WSL2
+
+在运行 dsh 的 WSL profile 中使用下方相同命令安装插件。通知、声音、开始菜单
+快捷方式和点击助手属于当前 Windows 用户。插件通过 WSL 导入的 Windows `PATH`
+查找 Windows PowerShell，并使用 `wslpath -w` 转换图标和较大临时脚本的路径
+（包括通过 WSL UNC 暴露的 Linux 路径）。原生 Windows 仍使用 `%SystemRoot%`
+和原有 Windows 路径。
+
+点击跳转要求 Windows 助手/浏览器能够访问 WSL GUI。通常 WSL 的 localhost
+转发可使 `http://127.0.0.1:<port>` 可达；不可达时检查 WSL 网络和 GUI 绑定地址。
+非环回的自定义 `baseUrl` 仍走现有浏览器深链回退，不使用直接激活。
+不支持普通 Linux 或 macOS。
 
 ## 安装
 
@@ -74,8 +90,35 @@ bundle 会在 profile 中插入加载行 `win-notify`。在 profile 的 `cordis.
 
 ## 故障排查
 
+点击助手支持 Chrome、Edge、Firefox 和 Firefox Nightly。现有 GUI 确认会话切换后，
+助手先根据该 GUI 上报的标题匹配 Windows 窗口标题，包括浏览器附加的标题分隔符。
+Harness 标签已被选中时，无需辅助功能即可将窗口带到前台。
+如果 Harness 隐藏在其他标签后，原有 UI Automation 路径仍需浏览器提供标签辅助功能树。
+Firefox 的 `accessibility.force_disabled=1` 会禁用该树；插件不会修改此设置。
+Windows 前台限制仍然适用。
+
 - **没有通知：** 检查 Windows 设置 → 系统 → 通知 → `DSH.WinNotify` 已启用；同时确认开始菜单快捷方式 `DeepSeek.lnk` 存在。
 - **诊断日志：** 插件会把每次注册尝试与通知追加记录到 `$DSH_HOME/dsh-win-notify.log`。
+- **WSL 前置检查：** 执行 `command -v powershell.exe` 和 `wslpath -w /tmp`。
+  找不到 Windows PowerShell 时记录 `registration unavailable`；路径转换失败单独记录。
+  如果禁用了互操作或 Windows PATH 导入，请启用后在安全时机重新启动 WSL shell/宿主进程。
+
+## 开发与验证
+
+在 Windows 和 WSL 中运行 `npm test`（或
+`node --test test/plugin.test.js test/windows-host.test.js`）。无需额外测试依赖。
+测试覆盖宿主检测、路径转换与引号转义、脚本暂存与清理、注册重试、气泡回退，
+以及完成通知和前台抑制。测试模拟系统操作，不显示通知或修改注册。
+
+Windows 上还可运行 `powershell.exe -NoProfile -NonInteractive -File
+test/windows-activation.test.ps1`。该测试编译实际 C# 助手，验证浏览器与标题匹配，
+并模拟原生窗口发现和恢复；不操作实际浏览器窗口。
+
+手动验证请使用空闲的测试 profile：确认日志中有 `toast=true scheme=true`，
+然后在 GUI 标签页未聚焦时完成顶层任务，检查通知和配置的声音。
+切换到另一浏览器标签后点击通知，确认现有 GUI 选中正确会话并来到前台，
+且没有新建标签页。同时检查手动中止的回合和正在前台查看的会话保持静默。
+Windows 通知设置、浏览器辅助功能和前台限制仍然适用。
 
 ## 许可证
 

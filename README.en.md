@@ -18,7 +18,25 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plug
 ## Requirements
 
 - Windows 10/11
+- Native Windows Node.js, or WSL2 with Windows executable interop enabled.
+  In WSL, `powershell.exe` (Windows PowerShell 5.1) must be on `PATH`, and
+  `wslpath` must be available. PowerShell 7 (`pwsh`) is not required.
 - dsh (DeepSeek Harness) — any profile (web, headless, tui)
+
+### WSL2
+
+Install the plugin inside the WSL profile that runs dsh, using the same install
+command below. Toasts, sound, the Start Menu shortcut, and the click helper
+belong to the signed-in Windows user. The plugin finds Windows PowerShell via
+WSL's imported Windows `PATH`; it translates the icon and large temporary
+script paths with `wslpath -w` (including Linux paths exposed through WSL UNC).
+Native Windows continues to use `%SystemRoot%` and unchanged Windows paths.
+
+For click-to-session, the Windows helper/browser must be able to reach the
+WSL GUI URL. WSL localhost forwarding normally makes `http://127.0.0.1:<port>`
+reachable from Windows. If it does not, check WSL networking and the GUI bind
+address. A custom non-loopback `baseUrl` uses the existing browser deep-link
+fallback rather than direct activation. Plain Linux and macOS are unsupported.
 
 ## Install
 
@@ -91,10 +109,11 @@ config in the profile's `cordis.patch.yml`:
    `DeepSeek.exe` helper rather than a browser. It asks the local DSH server
    to deliver an `open-session` command to the most recently focused live GUI
    tab; that tab calls `sessions.open(id)` in place (no full-page refresh and
-   no new browser tab). After a successful acknowledgement, the helper makes a
-   best-effort Windows UI Automation selection of the matching Chrome/Edge tab,
-   so a click made while you are browsing another tab can bring the DSH tab to
-   the foreground. The helper matches the tab by its post-switch title, with a
+   no new browser tab). After a successful acknowledgement, the helper first
+   matches the title reported by the GUI to a native Chrome, Edge, or Firefox
+   window and brings it forward. If the Harness tab is not selected, it tries
+   Windows UI Automation to select the matching browser tab. This path needs
+   browser accessibility. The helper matches the tab by its post-switch title, with a
    race-proof app-name fallback, and preserves maximized or normally sized
    browser windows; only minimized windows are restored. Browser accessibility,
    elevation, virtual-desktop, and focus-stealing policy can still prevent
@@ -108,11 +127,45 @@ config in the profile's `cordis.patch.yml`:
 
 ## Troubleshooting
 
+The click helper supports Chrome, Edge, Firefox, and Firefox Nightly. After the
+existing GUI acknowledges the session switch, it first matches the native window
+title against the title reported by that GUI, including browser title decoration.
+This can foreground the window without accessibility when the Harness tab is
+already selected. If that tab is hidden behind another tab, the existing UI
+Automation path still requires an accessible browser tab tree. In Firefox,
+`accessibility.force_disabled=1` disables that tree; the plugin does not change
+this preference. Windows foreground restrictions still apply.
+
 - **No notifications:** check Windows Settings → System → Notifications →
   `DSH.WinNotify` is enabled. Also make sure the Start Menu shortcut
   `DeepSeek.lnk` exists.
 - **Diagnostics:** the plugin appends a log line for every registration
   attempt and notification at `$DSH_HOME/dsh-win-notify.log`.
+- **WSL prerequisites:** check `command -v powershell.exe` and `wslpath -w /tmp`.
+  Missing Windows PowerShell is logged as `registration unavailable`; failed
+  path conversions are logged separately. If interop or Windows PATH import
+  was disabled, enable it and start a new WSL shell/host process when safe.
+
+## Development and verification
+
+Run `npm test` (or `node --test test/plugin.test.js test/windows-host.test.js`)
+on Windows and WSL. The tests need no additional test dependencies. They
+cover host detection, path conversion/quoting, script staging and cleanup,
+registration retry, balloon fallback, and completion/focus suppression.
+The tests mock OS effects and do not display notifications or alter registration.
+
+On Windows, also run `powershell.exe -NoProfile -NonInteractive -File
+test/windows-activation.test.ps1`. It compiles the production C# helper and tests
+browser/title matching plus mocked native window discovery and restoration.
+It does not interact with live browser windows.
+
+For manual verification in an idle test profile, confirm that registration
+reports `toast=true scheme=true`, then finish a top-level task while its GUI
+tab is unfocused. Check the toast and configured sound. Click it while viewing
+another browser tab and verify that the existing GUI selects the correct
+session and comes forward without opening a new tab. Also check an aborted
+turn and a focused session remain silent. Windows notification settings,
+browser accessibility, and foreground restrictions still apply.
 
 ## License
 
